@@ -1,0 +1,6 @@
+- insert:
+    - id: autodata-service
+      name: '@zlzlge/autodata/service'
+
+    - id: autodata-tool
+      name: '@zlzlge/autodata/tool'
