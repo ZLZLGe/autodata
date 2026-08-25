@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -31,6 +31,32 @@ function run(command, args, options = {}) {
   return result
 }
 
+function runFailure(command, args, options = {}) {
+  const result = spawnSync(command, args, {
+    cwd: root,
+    encoding: 'utf8',
+    timeout: 120_000,
+    ...options,
+  })
+  if (result.error) throw result.error
+  if (result.status === 0) {
+    throw new Error(`command unexpectedly succeeded: ${command} ${args.join(' ')}`)
+  }
+  return result
+}
+
+function assertMissingPeerFailure(cwd, entrypoint, peer) {
+  const result = runFailure(process.execPath, [
+    '--input-type=module',
+    '--eval',
+    `import(${JSON.stringify(entrypoint)})`,
+  ], { cwd })
+  const output = `${result.stdout ?? ''}\n${result.stderr ?? ''}`
+  if (!output.includes('ERR_MODULE_NOT_FOUND') || !output.includes(peer)) {
+    throw new Error(`missing peer dependency ${peer} did not fail clearly:\n${output}`)
+  }
+}
+
 async function waitFor(path, closed, label) {
   const deadline = Date.now() + 30_000
   while (!existsSync(path)) {
@@ -51,6 +77,19 @@ try {
   const tarballs = readdirSync(packDirectory).filter(file => file.endsWith('.tgz'))
   if (tarballs.length !== 1) throw new Error(`expected one tarball, found ${tarballs.length}`)
   const tarball = join(packDirectory, tarballs[0])
+
+  const peerlessDirectory = join(scratch, 'peerless-consumer')
+  mkdirSync(peerlessDirectory)
+  writeFileSync(join(peerlessDirectory, 'package.json'), JSON.stringify({
+    name: 'autodata-peerless-consumer',
+    private: true,
+    type: 'module',
+  }))
+  run('npm', ['install', '--ignore-scripts', '--legacy-peer-deps', '--no-audit', '--no-fund', tarball], {
+    cwd: peerlessDirectory,
+  })
+  assertMissingPeerFailure(peerlessDirectory, '@zlzlge/autodata/service', '@deepseek-ai/cordis')
+  assertMissingPeerFailure(peerlessDirectory, '@zlzlge/autodata/tool', '@deepseek-ai/dsh-tools')
 
   const env = {
     ...process.env,
@@ -141,6 +180,19 @@ try {
     throw new Error(`DSH shutdown failed: ${JSON.stringify(result)}`)
   }
   if (!existsSync(disposed)) throw new Error('AutoData probe was not disposed during DSH shutdown')
+
+  const installedPatch = join(profileDirectory, 'node_modules', '@zlzlge', 'autodata', 'cordis.patch.yml')
+  const hiddenPatch = `${installedPatch}.missing`
+  renameSync(installedPatch, hiddenPatch)
+  try {
+    const missingPatch = runFailure(dsh, ['--profile', 'autodata', '--dump-config'], { env })
+    const missingPatchOutput = `${missingPatch.stdout ?? ''}\n${missingPatch.stderr ?? ''}`
+    if (!missingPatchOutput.includes('failed to read overlay') || !missingPatchOutput.includes('cordis.patch.yml')) {
+      throw new Error(`missing bundle patch did not fail clearly:\n${missingPatchOutput}`)
+    }
+  } finally {
+    renameSync(hiddenPatch, installedPatch)
+  }
 
   run(dsh, ['plugin', '--profile', 'autodata', 'remove', '@zlzlge/autodata'], { env })
   const removedProfile = JSON.parse(readFileSync(join(profileDirectory, 'package.json'), 'utf8'))
