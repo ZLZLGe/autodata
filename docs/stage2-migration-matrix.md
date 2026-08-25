@@ -1,6 +1,7 @@
 # AutoData Stage 2 Core 迁移矩阵
 
-状态：提议中。本文档是 Gate 2 之前的可执行边界，不表示 Stage 2 已经完成。
+状态：已确认，执行中（2026-08-26）。本文档是 Gate 2 之前的可执行边界，
+不表示 Stage 2 已经完成。
 
 ## 目标
 
@@ -76,3 +77,15 @@ Gate 2 结束后停止，不自动进入 persistence、Controller/Evolver、Pyth
 - 是否只允许 host/plugin context 注册 DataPlugin，禁止 agent scope 直接改变共享 registry。
 - 是否在本阶段加入 `autodata_plugins`（推荐）而把 `autodata_context` 保持为 host API。
 - Stage 2 candidate 版本使用 `0.2.0-rc.1` 还是继续 `0.1.0-rc.*`；版本变更应在 Gate 2 验证后单独提交。
+
+## 当前执行记录
+
+截至 2026-08-26，仓库已实现 Core 的第一条垂直链路：严格 JSON/canonical
+边界、OpenAI tool-trajectory adapter、选择/quarantine、内存精确去重、
+DataPlugin pipeline、provenance 和 logical training view；`ctx.autodata`
+已提供注册表、运行 API、深冻结 DataContext、最小 typed events，以及
+`autodata_status`、`autodata_plugins`、`autodata_context` 只读工具。
+
+已验证：typecheck、17 项单元/生命周期测试、Node 22/24 Profile/tarball
+smoke 和 npm pack。尚未实现持久化、Controller/Evolver、动态候选代码、
+Python/ms-swift、训练、评测或 GPU；这些仍由后续阶段门控制。

@@ -2,6 +2,7 @@
 
 export type AutoDataCoreErrorCode =
   | 'INVALID_PLUGIN'
+  | 'PLUGIN_FAILED'
   | 'PLUGIN_ALREADY_REGISTERED'
   | 'PLUGIN_NOT_FOUND'
   | 'INVALID_RUN_REQUEST'
@@ -10,7 +11,8 @@ export type AutoDataCoreErrorCode =
   | 'DUPLICATE_RECORD_ID'
   | 'MISSING_SELECTED_RECORD'
   | 'EMPTY_SELECTION'
-  | 'PLUGIN_FAILED'
+  | 'EMPTY_TRAINING_VIEW'
+  | 'INVALID_JSON'
   | 'CONTEXT_UNAVAILABLE'
   | 'HOST_SCOPE_REQUIRED'
 
@@ -19,13 +21,7 @@ export interface AutoDataCoreErrorOptions {
   readonly cause?: unknown
 }
 
-/**
- * A typed failure at the public Core boundary.
- *
- * `cause` is retained for host diagnostics but is not part of model-visible
- * tool output or run summaries. The class deliberately carries no hash,
- * lock, persistence, or timestamp state.
- */
+/** A typed failure at the public Core boundary. */
 export class AutoDataCoreError extends Error {
   readonly code: AutoDataCoreErrorCode
   readonly plugin_id?: string
@@ -37,3 +33,7 @@ export class AutoDataCoreError extends Error {
     if (options.plugin_id !== undefined) this.plugin_id = options.plugin_id
   }
 }
+
+/** Migration alias retained for callers of the old in-memory runner. */
+export { AutoDataCoreError as DataHarnessError }
+export type DataHarnessErrorCode = AutoDataCoreErrorCode

@@ -1,4 +1,4 @@
-/** Public, model-independent type skeleton for the Stage 2 Core. */
+/** Public, model-independent types for the AutoData in-memory Core. */
 
 export type JsonPrimitive = null | boolean | number | string
 export type JsonValue = JsonPrimitive | readonly JsonValue[] | JsonObject
@@ -16,13 +16,11 @@ export interface DataSourceIdentity {
   readonly dataset_id: string
   readonly dataset_revision: string
 }
-
 export interface CanonicalSourceReference extends DataSourceIdentity {
   readonly record_id: string
   readonly record_index: number
   readonly record_line: number
 }
-
 export interface CanonicalTrajectory {
   readonly schema_version: string
   readonly source: CanonicalSourceReference
@@ -38,25 +36,27 @@ export interface ValidationIssue {
   readonly path: string
   readonly severity: ValidationSeverity
 }
+export interface SerializedToolCallAnalysis {
+  readonly detected: boolean
+  readonly function_names: readonly string[]
+  readonly malformed: boolean
+}
 
 export interface SourceSnapshot {
   readonly dataset_id: string
   readonly dataset_revision: string
   readonly records: Iterable<unknown>
 }
-
 export interface SourceAdapterContext {
   readonly record_id: string
   readonly record_index: number
   readonly record_line: number
 }
-
 export interface SourceAdapterResult {
   readonly messages: readonly CanonicalMessage[]
   readonly tools: readonly CanonicalTool[]
   readonly warnings: readonly ValidationIssue[]
 }
-
 export interface SourceAdapter {
   readonly id: string
   readonly version: string
@@ -69,24 +69,21 @@ export interface PluginSelectionProvenance {
   readonly plugin_version: string
   readonly note?: string
 }
-
 export interface DataSelection {
   readonly record: CanonicalTrajectory
   readonly provenance: readonly PluginSelectionProvenance[]
 }
-
 export interface DataPluginDecision {
   readonly record_id: string
   readonly note?: string
 }
-
-/** Explicit deterministic inputs. No ambient session or wall-clock state. */
+/** Explicit run inputs; no ambient session, wall-clock, or persistence state. */
 export interface DataPluginContext {
   readonly harness_id: string
   readonly generation: number
   readonly seed: number
+  readonly source: DataSourceIdentity
 }
-
 export interface DataPlugin {
   readonly id: string
   readonly version: string
@@ -95,11 +92,11 @@ export interface DataPlugin {
     context: DataPluginContext,
   ) => readonly DataPluginDecision[]
 }
-
 export interface DataPluginDescriptor {
   readonly id: string
   readonly version: string
 }
+export type DataPluginSummaryEntry = DataPluginDescriptor
 
 export interface LogicalTrainingUnit {
   readonly schema_version: string
@@ -112,6 +109,18 @@ export interface LogicalTrainingUnit {
   readonly plugin_provenance: readonly PluginSelectionProvenance[]
 }
 
+/** A complete explicit run, resolved against executable plugin snapshots. */
+export interface DataRunRequest {
+  readonly harness_id: string
+  readonly generation: number
+  readonly seed: number
+  readonly source: SourceSnapshot
+  readonly source_adapter: SourceAdapter
+  readonly selected_record_ids: readonly string[] | null
+  readonly quarantine_record_ids: readonly string[]
+  readonly plugins: readonly DataPlugin[]
+}
+/** Request accepted by the service registry before plugin IDs are resolved. */
 export interface RegisteredDataRunRequest {
   readonly harness_id: string
   readonly generation: number
@@ -143,38 +152,26 @@ export interface DataRunSummary {
   }
   readonly validation_warning_counts: Readonly<Record<string, number>>
 }
-
 export interface DataRunResult {
   readonly canonical_records: readonly CanonicalTrajectory[]
   readonly logical_training_view: readonly LogicalTrainingUnit[]
   readonly summary: DataRunSummary
 }
+/** Compatibility aliases for migration callers; no persistence is implied. */
+export type DataHarnessRunRequest = DataRunRequest
+export type DataHarnessRunResult = DataRunResult
+export type DataHarnessRunSummary = DataRunSummary
+export type RegisteredDataHarnessRunRequest = RegisteredDataRunRequest
 
-export interface DataSessionSnapshot {
-  readonly id: string
-  readonly seq: number
-}
-
-export type DataAgentStatus = 'idle' | 'running'
-
-export interface DataAgentSnapshot {
-  readonly id: string
-  readonly status: DataAgentStatus
-}
-
-export interface DataWorkspaceSnapshot {
-  readonly id?: string
-  readonly title?: string
-  readonly cwd?: string
-}
-
-/** A schema projection; it intentionally has no executable callback. */
+export interface DataSessionSnapshot { readonly id: string; readonly seq: number }
+export type DataAgentStatus = 'idle' | 'running' | 'unknown'
+export interface DataAgentSnapshot { readonly id: string; readonly status: DataAgentStatus }
+export interface DataWorkspaceSnapshot { readonly id?: string; readonly title?: string; readonly cwd?: string }
 export interface DataToolSchema {
   readonly name: string
   readonly description?: string
   readonly parameters: JsonObject
 }
-
 export interface DataContext {
   readonly schema_version: string
   readonly plugins: readonly DataPluginDescriptor[]
@@ -183,15 +180,12 @@ export interface DataContext {
   readonly workspace?: DataWorkspaceSnapshot
   readonly tools?: readonly DataToolSchema[]
 }
-
-/** Explicit lookup input; omitted means use the caller-bound DSH scope. */
+/** Host-only lookup hint; the optional agent is consumed only to scope schemas. */
 export interface DataContextRequest {
   readonly agent_id?: string
+  readonly agent?: unknown
 }
-
 export type AutoDataDisposer = () => void | Promise<void>
-
-/** Service-facing contract to be wired after the pure skeleton is approved. */
 export interface AutoDataCore {
   readonly register: (plugin: DataPlugin) => AutoDataDisposer
   readonly plugins: () => readonly DataPluginDescriptor[]

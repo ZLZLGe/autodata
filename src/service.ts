@@ -1,10 +1,25 @@
 import { Service, type Context } from '@deepseek-ai/cordis'
+import {
+  AutoDataCoreError,
+  h0DataPlugin,
+  runDataCore,
+  type DataContext,
+  type DataContextRequest,
+  type DataPlugin,
+  type DataPluginDescriptor,
+  type DataRunResult,
+  type RegisteredDataRunRequest,
+} from './core/index.js'
 
 /** AutoData package version exposed by the Stage 1 service contract. */
 export const AUTODATA_VERSION = '0.1.0-rc.1'
 
 /** The capabilities currently exposed by the AutoData bundle. */
-export const AUTODATA_CAPABILITIES = Object.freeze(['autodata_status'] as const)
+export const AUTODATA_CAPABILITIES = Object.freeze([
+  'autodata_status',
+  'autodata_plugins',
+  'autodata_context',
+] as const)
 
 /** A read-only snapshot of the live AutoData service. */
 export interface AutoDataStatus {
@@ -17,22 +32,267 @@ declare module '@deepseek-ai/cordis' {
   interface Context {
     autodata: AutoDataService
   }
+  interface Events {
+    'autodata/plugin-registered': (descriptor: DataPluginDescriptor) => void
+    'autodata/plugin-unregistered': (descriptor: DataPluginDescriptor) => void
+    'autodata/run-started': (summary: { readonly harness_id: string; readonly generation: number }) => void
+    'autodata/run-completed': (summary: { readonly harness_id: string; readonly generation: number; readonly canonical_records: number; readonly logical_training_units: number }) => void
+    'autodata/run-failed': (summary: { readonly harness_id: string; readonly generation: number; readonly code: string }) => void
+  }
 }
 
-/** Minimal AutoData service mounted into the shared DSH Cordis context. */
+interface RegisteredPlugin {
+  readonly descriptor: DataPluginDescriptor
+  readonly plugin: DataPlugin
+}
+
+/** AutoData's in-memory data Core mounted into the shared DSH Cordis context. */
 export class AutoDataService extends Service {
+  private readonly registry = new Map<string, RegisteredPlugin>()
+
   constructor(ctx: Context) {
     super(ctx, 'autodata')
+    const h0 = snapshotPlugin(h0DataPlugin)
+    this.registry.set(h0.descriptor.id, h0)
   }
 
   /** Return deterministic in-memory status without reading project or run data. */
   status(): AutoDataStatus {
-    return {
+    return Object.freeze({
       version: AUTODATA_VERSION,
       ready: true,
       capabilities: AUTODATA_CAPABILITIES,
+    })
+  }
+
+  /** Register a trusted host plugin and return an exact, idempotent disposer. */
+  register(plugin: DataPlugin): () => void {
+    if (hasAgentScope(this.ctx)) {
+      throw new AutoDataCoreError(
+        'DataPlugin registration is only available from the host scope',
+        'HOST_SCOPE_REQUIRED',
+      )
+    }
+    const registered = snapshotPlugin(plugin)
+    if (this.registry.has(registered.descriptor.id)) {
+      throw new AutoDataCoreError(
+        `DataPlugin ${registered.descriptor.id} is already registered`,
+        'PLUGIN_ALREADY_REGISTERED',
+        { plugin_id: registered.descriptor.id },
+      )
+    }
+
+    // Register through Cordis' effect mechanism so the caller's Bundle/fiber
+    // owns the exact plugin snapshot. Service construction itself owns H0.
+    let active = true
+    const remove = () => {
+      if (!active) return
+      active = false
+      const current = this.registry.get(registered.descriptor.id)
+      if (current !== registered) return
+      this.registry.delete(registered.descriptor.id)
+      emitContained(this.ctx, 'autodata/plugin-unregistered', registered.descriptor)
+    }
+    this.registry.set(registered.descriptor.id, registered)
+    emitContained(this.ctx, 'autodata/plugin-registered', registered.descriptor)
+    try {
+      const effect = this.ctx.effect(() => remove, 'autodata.register()')
+      // The public disposer tears down the effect; its return value may be a
+      // promise, but the Core registry itself remains synchronous.
+      return effect
+    } catch (error) {
+      remove()
+      throw error
     }
   }
+
+  /** Return sorted immutable plugin descriptors without executable callbacks. */
+  plugins(): readonly DataPluginDescriptor[] {
+    return Object.freeze([...this.registry.values()]
+      .map(entry => entry.descriptor)
+      .sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0))
+  }
+
+  /** Run an explicit in-memory source pipeline against a plugin snapshot. */
+  run(request: RegisteredDataRunRequest): DataRunResult {
+    const pluginIds = request?.plugin_ids
+    if (!Array.isArray(pluginIds)) {
+      throw new AutoDataCoreError('plugin_ids must be an array', 'INVALID_RUN_REQUEST')
+    }
+    const seen = new Set<string>()
+    const plugins: DataPlugin[] = []
+    for (const id of pluginIds) {
+      if (typeof id !== 'string' || id.length === 0) {
+        throw new AutoDataCoreError('plugin_ids must contain non-empty strings', 'INVALID_RUN_REQUEST')
+      }
+      if (seen.has(id)) {
+        throw new AutoDataCoreError(`plugin_ids contains duplicate id ${id}`, 'INVALID_RUN_REQUEST', { plugin_id: id })
+      }
+      seen.add(id)
+      const registered = this.registry.get(id)
+      if (!registered) {
+        throw new AutoDataCoreError(`DataPlugin ${id} is not registered`, 'PLUGIN_NOT_FOUND', { plugin_id: id })
+      }
+      plugins.push(registered.plugin)
+    }
+
+    const started = Object.freeze({ harness_id: request.harness_id, generation: request.generation })
+    emitContained(this.ctx, 'autodata/run-started', started)
+    try {
+      const result = runDataCore({ ...request, plugins })
+      emitContained(this.ctx, 'autodata/run-completed', Object.freeze({
+        ...started,
+        canonical_records: result.summary.counts.canonical_records,
+        logical_training_units: result.summary.counts.logical_training_units,
+      }))
+      return result
+    } catch (error) {
+      const code = error instanceof AutoDataCoreError ? error.code : 'PLUGIN_FAILED'
+      emitContained(this.ctx, 'autodata/run-failed', Object.freeze({ ...started, code }))
+      throw error
+    }
+  }
+
+  /** Build a deep-frozen structural snapshot of the current DSH scope. */
+  context(request?: DataContextRequest): DataContext {
+    const agent = resolveAgent(this.ctx, request)
+    return buildDataContext(this.ctx, agent, this.plugins())
+  }
+}
+
+function snapshotPlugin(plugin: DataPlugin): RegisteredPlugin {
+  const value: unknown = plugin
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new AutoDataCoreError('DataPlugin must be an object', 'INVALID_PLUGIN')
+  }
+  const candidate = value as Record<string, unknown>
+  if (typeof candidate.id !== 'string' || !/^[a-z][a-z0-9-]*$/u.test(candidate.id)) {
+    throw new AutoDataCoreError('DataPlugin id must match /^[a-z][a-z0-9-]*$/', 'INVALID_PLUGIN')
+  }
+  if (typeof candidate.version !== 'string' || candidate.version.length === 0) {
+    throw new AutoDataCoreError(`DataPlugin ${candidate.id} must declare a version`, 'INVALID_PLUGIN', { plugin_id: candidate.id })
+  }
+  if (typeof candidate.run !== 'function') {
+    throw new AutoDataCoreError(`DataPlugin ${candidate.id} must declare run()`, 'INVALID_PLUGIN', { plugin_id: candidate.id })
+  }
+  const descriptor = Object.freeze({ id: candidate.id, version: candidate.version })
+  const run = candidate.run as DataPlugin['run']
+  const snapshot = Object.freeze({
+    id: descriptor.id,
+    version: descriptor.version,
+    run(input: Parameters<DataPlugin['run']>[0], context: Parameters<DataPlugin['run']>[1]) {
+      return run.call(snapshot, input, context)
+    },
+  }) as DataPlugin
+  return { descriptor, plugin: snapshot }
+}
+
+function hasAgentScope(ctx: Context): boolean {
+  return Boolean(ctx.get('agent', false))
+}
+
+function emitContained<K extends keyof import('@deepseek-ai/cordis').Events>(
+  ctx: Context,
+  event: K,
+  ...args: Parameters<import('@deepseek-ai/cordis').Events[K]>
+): void {
+  try {
+    void ctx.parallel(event, ...args).catch(error => {
+      // Events are notifications only. A listener cannot undo a committed Core
+      // state change or make a successful run fail.
+      try { ctx.logger.error(error) } catch { /* host logger is optional in tests */ }
+    })
+  } catch (error) {
+    try { ctx.logger.error(error) } catch { /* host logger is optional in tests */ }
+  }
+}
+
+function resolveAgent(ctx: Context, request: DataContextRequest | undefined): unknown {
+  if (request && typeof request === 'object' && 'agent' in request) {
+    return (request as { readonly agent?: unknown }).agent
+  }
+  if (request?.agent_id !== undefined) {
+    const agents = ctx.get('agents', false) as { get?: (id: string) => unknown } | undefined
+    return typeof agents?.get === 'function' ? agents.get(request.agent_id) : undefined
+  }
+  return ctx.get('agent', false)
+}
+
+function buildDataContext(ctx: Context, agent: unknown, plugins: readonly DataPluginDescriptor[]): DataContext {
+  const agentSession = agent && typeof agent === 'object'
+    ? (agent as Record<string, unknown>).session
+    : undefined
+  const sessionValue = agentSession ?? ctx.get('session', false)
+  const session = readSession(sessionValue)
+  const agentSnapshot = readAgent(agent)
+  const tools = readTools(ctx, agent)
+  const workspace = session?.cwd === undefined ? undefined : Object.freeze({ cwd: session.cwd })
+  const result: Record<string, unknown> = {
+    schema_version: 'autodata-context-1',
+    plugins: plugins.map(plugin => Object.freeze({ ...plugin })),
+  }
+  if (session) result.session = session
+  if (agentSnapshot) result.agent = agentSnapshot
+  if (workspace) result.workspace = workspace
+  if (tools) result.tools = tools
+  return deepFreeze(result) as unknown as DataContext
+}
+
+function readSession(value: unknown): (NonNullable<DataContext['session']> & { readonly cwd?: string }) | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const candidate = value as Record<string, unknown>
+  const id = candidate.id
+  const seqValue = candidate.seq
+  if (typeof id !== 'string' || typeof seqValue !== 'number' || !Number.isSafeInteger(seqValue)) return undefined
+  const seq = seqValue
+  const header = candidate.header
+  const cwd = header && typeof header === 'object' && typeof (header as Record<string, unknown>).cwd === 'string'
+    ? (header as Record<string, unknown>).cwd as string
+    : undefined
+  return Object.freeze(cwd === undefined ? { id, seq } : { id, seq, cwd })
+}
+
+function readAgent(value: unknown): DataContext['agent'] | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const candidate = value as Record<string, unknown>
+  if (typeof candidate.id !== 'string') return undefined
+  const status = candidate.status === 'running' || candidate.status === 'idle'
+    ? candidate.status
+    : 'unknown'
+  return Object.freeze({ id: candidate.id, status })
+}
+
+function readTools(ctx: Context, agent: unknown): DataContext['tools'] | undefined {
+  const tools = ctx.get('tools', false) as { schemas?: (scope?: unknown) => unknown } | undefined
+  if (!tools || typeof tools.schemas !== 'function') return undefined
+  const schemas = tools.schemas(agent)
+  if (!Array.isArray(schemas)) return undefined
+  return Object.freeze(schemas.map((schema: unknown) => {
+    if (!schema || typeof schema !== 'object') return Object.freeze({ name: '', parameters: {} })
+    const value = schema as Record<string, unknown>
+    const result: Record<string, unknown> = {
+      name: typeof value.name === 'string' ? value.name : '',
+      parameters: cloneJson(value.parameters ?? {}),
+    }
+    if (typeof value.description === 'string') result.description = value.description
+    return deepFreeze(result) as unknown as NonNullable<DataContext['tools']>[number]
+  }))
+}
+
+function cloneJson(value: unknown): unknown {
+  if (value === null || typeof value !== 'object') return value
+  if (Array.isArray(value)) return value.map(cloneJson)
+  const result: Record<string, unknown> = {}
+  for (const [key, entry] of Object.entries(value)) result[key] = cloneJson(entry)
+  return result
+}
+
+function deepFreeze<T>(value: T): T {
+  if (value && typeof value === 'object' && !Object.isFrozen(value)) {
+    Object.freeze(value)
+    for (const child of Object.values(value as Record<string, unknown>)) deepFreeze(child)
+  }
+  return value
 }
 
 export default AutoDataService

@@ -128,8 +128,11 @@ try {
     '  void ctx.loader.await().then(() => {',
     '    if (!active) return',
     "    const status = ctx.autodata.status()",
+    "    const plugins = ctx.autodata.plugins()",
+    "    const context = ctx.autodata.context()",
     "    const visible = ctx.tools.schemas().some(schema => schema.name === 'autodata_status')",
-    '    writeFileSync(process.env.AUTODATA_SMOKE_READY, JSON.stringify({ status, visible }))',
+    "    const pluginsVisible = ctx.tools.schemas().some(schema => schema.name === 'autodata_plugins')",
+    '    writeFileSync(process.env.AUTODATA_SMOKE_READY, JSON.stringify({ status, plugins, context, visible, pluginsVisible }))',
     '  })',
     '  ctx.effect(() => () => {',
     '    active = false',
@@ -169,6 +172,9 @@ try {
     throw new Error(`unexpected AutoData status: ${JSON.stringify(observed)}`)
   }
   if (!observed.visible) throw new Error('autodata_status is not visible in the DSH tool schema list')
+  if (!observed.pluginsVisible) throw new Error('autodata_plugins is not visible in the DSH tool schema list')
+  if (observed.plugins?.[0]?.id !== 'toolcall-h0') throw new Error(`unexpected plugin snapshot: ${JSON.stringify(observed)}`)
+  if (observed.context?.schema_version !== 'autodata-context-1') throw new Error(`unexpected context snapshot: ${JSON.stringify(observed)}`)
 
   child.kill('SIGTERM')
   const result = await Promise.race([

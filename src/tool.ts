@@ -5,7 +5,16 @@ import type {} from './service.js'
 export const name = 'autodata-status-tool'
 export const inject = ['autodata', 'tools']
 
-/** Register the first read-only AutoData tool with the DSH tool runtime. */
+const pluginDescriptorSchema = {
+  type: 'object' as const,
+  additionalProperties: false,
+  properties: {
+    id: { type: 'string' as const, required: true as const },
+    version: { type: 'string' as const, required: true as const },
+  },
+}
+
+/** Register the read-only AutoData tools with the DSH tool runtime. */
 export function apply(ctx: Context): void {
   ctx.tools.register(defineTool({
     name: 'autodata_status',
@@ -37,6 +46,53 @@ export function apply(ctx: Context): void {
         ready: status.ready,
         capabilities: [...status.capabilities],
       }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'autodata_plugins',
+    description: 'List the registered AutoData plugin descriptors.',
+    parameters: {},
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          plugins: {
+            type: 'array',
+            required: true,
+            items: pluginDescriptorSchema,
+          },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.plugins.length === 0
+          ? 'No AutoData plugins are registered.'
+          : `AutoData plugins: ${value.plugins.map(plugin => `${plugin.id}@${plugin.version}`).join(', ')}.`,
+      }],
+    },
+    async execute() {
+      return { plugins: ctx.autodata.plugins().map(plugin => ({ ...plugin })) }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'autodata_context',
+    description: 'Return a read-only snapshot of the current AutoData and DSH context.',
+    parameters: {},
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: true,
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: `AutoData context: ${JSON.stringify(value)}.`,
+      }],
+    },
+    async execute(_args, exec) {
+      return ctx.autodata.context({ agent: exec.agent }) as never
     },
   }))
 }
