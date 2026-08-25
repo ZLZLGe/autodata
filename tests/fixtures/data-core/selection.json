@@ -1,0 +1,13 @@
+{
+  "dataset_id": "fixture-agent-sft",
+  "dataset_revision": "fixture-v1",
+  "selected_record_ids": [
+    "trace-a",
+    "trace-b",
+    "trace-quarantine",
+    "trace-warning"
+  ],
+  "quarantine_record_ids": [
+    "trace-quarantine"
+  ]
+}

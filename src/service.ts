@@ -115,7 +115,12 @@ export class AutoDataService extends Service {
 
   /** Run an explicit in-memory source pipeline against a plugin snapshot. */
   run(request: RegisteredDataRunRequest): DataRunResult {
-    const pluginIds = request?.plugin_ids
+    const requestValue: unknown = request
+    if (typeof requestValue !== 'object' || requestValue === null || Array.isArray(requestValue)) {
+      throw new AutoDataCoreError('run request must be an object', 'INVALID_RUN_REQUEST')
+    }
+    const value = requestValue as Record<string, unknown>
+    const pluginIds = value.plugin_ids
     if (!Array.isArray(pluginIds)) {
       throw new AutoDataCoreError('plugin_ids must be an array', 'INVALID_RUN_REQUEST')
     }
@@ -136,10 +141,15 @@ export class AutoDataService extends Service {
       plugins.push(registered.plugin)
     }
 
-    const started = Object.freeze({ harness_id: request.harness_id, generation: request.generation })
+    const started = Object.freeze({
+      harness_id: typeof value.harness_id === 'string' ? value.harness_id : '',
+      generation: typeof value.generation === 'number' && Number.isSafeInteger(value.generation)
+        ? value.generation
+        : 0,
+    })
     emitContained(this.ctx, 'autodata/run-started', started)
     try {
-      const result = runDataCore({ ...request, plugins })
+      const result = runDataCore({ ...value, plugins } as RegisteredDataRunRequest & { plugins: DataPlugin[] })
       emitContained(this.ctx, 'autodata/run-completed', Object.freeze({
         ...started,
         canonical_records: result.summary.counts.canonical_records,
@@ -188,7 +198,21 @@ function snapshotPlugin(plugin: DataPlugin): RegisteredPlugin {
 }
 
 function hasAgentScope(ctx: Context): boolean {
-  return Boolean(ctx.get('agent', false))
+  return readAgentAssociation(ctx) !== undefined
+}
+
+/**
+ * Read the optional DSH agent association without requiring the dsh-agent
+ * package as a runtime dependency. Agent contexts expose `agent` as an own
+ * (inherited by child contexts) property; plain Cordis contexts may throw when
+ * an undeclared property is read through the proxy, so keep this probe safe.
+ */
+function readAgentAssociation(ctx: Context): unknown {
+  try {
+    return (ctx as unknown as { readonly agent?: unknown }).agent
+  } catch {
+    return undefined
+  }
 }
 
 function emitContained<K extends keyof import('@deepseek-ai/cordis').Events>(
@@ -215,7 +239,7 @@ function resolveAgent(ctx: Context, request: DataContextRequest | undefined): un
     const agents = ctx.get('agents', false) as { get?: (id: string) => unknown } | undefined
     return typeof agents?.get === 'function' ? agents.get(request.agent_id) : undefined
   }
-  return ctx.get('agent', false)
+  return readAgentAssociation(ctx)
 }
 
 function buildDataContext(ctx: Context, agent: unknown, plugins: readonly DataPluginDescriptor[]): DataContext {
@@ -223,10 +247,11 @@ function buildDataContext(ctx: Context, agent: unknown, plugins: readonly DataPl
     ? (agent as Record<string, unknown>).session
     : undefined
   const sessionValue = agentSession ?? ctx.get('session', false)
-  const session = readSession(sessionValue)
+  const sessionProjection = readSession(sessionValue)
+  const session = sessionProjection?.snapshot
   const agentSnapshot = readAgent(agent)
   const tools = readTools(ctx, agent)
-  const workspace = session?.cwd === undefined ? undefined : Object.freeze({ cwd: session.cwd })
+  const workspace = readWorkspace(ctx, sessionProjection?.cwd)
   const result: Record<string, unknown> = {
     schema_version: 'autodata-context-1',
     plugins: plugins.map(plugin => Object.freeze({ ...plugin })),
@@ -238,7 +263,12 @@ function buildDataContext(ctx: Context, agent: unknown, plugins: readonly DataPl
   return deepFreeze(result) as unknown as DataContext
 }
 
-function readSession(value: unknown): (NonNullable<DataContext['session']> & { readonly cwd?: string }) | undefined {
+interface SessionProjection {
+  readonly snapshot: NonNullable<DataContext['session']>
+  readonly cwd?: string
+}
+
+function readSession(value: unknown): SessionProjection | undefined {
   if (!value || typeof value !== 'object') return undefined
   const candidate = value as Record<string, unknown>
   const id = candidate.id
@@ -246,10 +276,34 @@ function readSession(value: unknown): (NonNullable<DataContext['session']> & { r
   if (typeof id !== 'string' || typeof seqValue !== 'number' || !Number.isSafeInteger(seqValue)) return undefined
   const seq = seqValue
   const header = candidate.header
-  const cwd = header && typeof header === 'object' && typeof (header as Record<string, unknown>).cwd === 'string'
+  const headerCwd = header && typeof header === 'object' && typeof (header as Record<string, unknown>).cwd === 'string'
     ? (header as Record<string, unknown>).cwd as string
     : undefined
-  return Object.freeze(cwd === undefined ? { id, seq } : { id, seq, cwd })
+  const cwd = headerCwd ?? (typeof candidate.cwd === 'string' ? candidate.cwd : undefined)
+  return Object.freeze({
+    snapshot: Object.freeze({ id, seq }),
+    ...(cwd === undefined ? {} : { cwd }),
+  })
+}
+
+/** Project optional DSH workspace metadata without retaining the live service. */
+function readWorkspace(ctx: Context, sessionCwd: string | undefined): DataContext['workspace'] | undefined {
+  let value: unknown
+  try {
+    value = ctx.get('workspace', false) ?? ctx.get('workspaceRegistry', false)
+  } catch {
+    value = undefined
+  }
+  const result: Record<string, unknown> = {}
+  if (value && typeof value === 'object') {
+    const candidate = value as Record<string, unknown>
+    if (typeof candidate.id === 'string') result.id = candidate.id
+    if (typeof candidate.title === 'string') result.title = candidate.title
+    if (typeof candidate.cwd === 'string') result.cwd = candidate.cwd
+    if (typeof candidate.path === 'string' && result.cwd === undefined) result.cwd = candidate.path
+  }
+  if (result.cwd === undefined && sessionCwd !== undefined) result.cwd = sessionCwd
+  return Object.keys(result).length === 0 ? undefined : deepFreeze(result) as DataContext['workspace']
 }
 
 function readAgent(value: unknown): DataContext['agent'] | undefined {

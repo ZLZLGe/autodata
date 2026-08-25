@@ -4,16 +4,21 @@ AutoData 是为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harne
 
 ## 当前状态
 
-`0.1.0-rc.1` 是第 1 阶段的 Bundle/生命周期验证版本，提供：
+`0.1.0-rc.1` 是当前候选版本，已完成阶段一 Bundle/生命周期验证和阶段二
+内存 Core 验收，提供：
 
 - `ctx.autodata`：确定性的内存状态服务；
 - `autodata_status`：面向模型的只读 DSH 工具；
 - 可安装的 `dsh.bundle.patch` 层；
-- 覆盖安装、加载、可见性和销毁流程的 tarball/Profile 测试。
+- 覆盖安装、加载、可见性和销毁流程的 tarball/Profile 测试；
+- canonical 轨迹、选择/quarantine、精确去重、DataPlugin pipeline 和
+  logical training view；
+- 深冻结的 DSH 上下文只读投影与插件生命周期事件。
 
-本阶段有意不实现轨迹处理、DataPlugin、进化控制、持久化、Python 训练和 GPU 评测。
+阶段二保持纯内存、单进程、同步模型；持久化、进化控制、Python 训练和 GPU
+评测仍未实现。
 
-## 阶段二（开发中）
+## 阶段二（Gate 2 已完成）
 
 阶段二在同一个 `ctx.autodata` Service 上增加内存 Core：调用方显式提供
 source adapter、选择/quarantine 和运行元数据，Core 将记录转换为 canonical
@@ -41,7 +46,7 @@ const result = ctx.autodata.run({
 
 阶段二保持单进程、同步、内存模型，不写磁盘，也不引入锁、CAS、运行时哈希链、
 动态任意代码加载、Controller、训练或 GPU。阶段二 Gate 通过后会暂停，另行
-审批持久化和自进化 Controller。
+审批持久化和自进化 Controller；当前已在 Gate 2 停止。
 
 ## 环境要求
 

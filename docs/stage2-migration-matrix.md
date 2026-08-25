@@ -1,7 +1,7 @@
 # AutoData Stage 2 Core 迁移矩阵
 
-状态：已确认，执行中（2026-08-26）。本文档是 Gate 2 之前的可执行边界，
-不表示 Stage 2 已经完成。
+状态：已确认，Gate 2 已完成（2026-08-26）。本文档记录阶段二的可执行边界
+和验收结果；不授权自动进入阶段三。
 
 ## 目标
 
@@ -31,9 +31,10 @@ DSH 仍然拥有 Agent loop、Session、工具注册和工具执行。AutoData �
 | 独立 session/log、重复 tool executor、重复 patch 校验 | 删除 | DSH 已提供权威实现；AutoData 只能观察其只读投影或注册自己的工具。 |
 | Python、ms-swift、GPU、训练和评测 | 延后 | 通过 Stage 4 外部 adapter/job 接入，不进入本阶段包。 |
 
-## Stage 2 公共 Core 契约（草案）
+## Stage 2 公共 Core 契约
 
-公共类型骨架位于 `src/core/types.ts`，错误骨架位于 `src/core/errors.ts`。计划由 `AutoDataService` 在后续提交中实现：
+公共类型和错误位于 `src/core/types.ts` 与 `src/core/errors.ts`，并已由
+`AutoDataService` 实现：
 
 ```ts
 ctx.autodata.register(plugin): disposer
@@ -53,7 +54,10 @@ ctx.autodata.context(request?): DataContext
 
 ## 工具和事件边界
 
-Stage 2 保留 `autodata_status`。建议增加一个只读 `autodata_plugins` 工具用于列出 descriptor；`autodata_run` 不作为模型工具暴露，直到 source registry、权限和 Controller 边界确定。所有工具继续使用 DSH `ctx.tools.register()` / `ctx.tools.execute()`。
+Stage 2 保留 `autodata_status`，并增加只读 `autodata_plugins` 与
+`autodata_context` 工具用于列出 descriptor 和查看上下文；`autodata_run`
+不作为模型工具暴露，直到 source registry、权限和 Controller 边界确定。
+所有工具继续使用 DSH `ctx.tools.register()` / `ctx.tools.execute()`。
 
 可提供最小的 Cordis live notification：`autodata/plugin-registered`、`autodata/plugin-unregistered`、`autodata/run-started`、`autodata/run-completed`、`autodata/run-failed`。事件只携带 descriptor、run metadata、counts 或错误 code；它们不是 session log，也不是事务回滚协议。listener 失败必须被 containment，不能改变已提交 registry 或 run result。
 
@@ -80,12 +84,17 @@ Gate 2 结束后停止，不自动进入 persistence、Controller/Evolver、Pyth
 
 ## 当前执行记录
 
-截至 2026-08-26，仓库已实现 Core 的第一条垂直链路：严格 JSON/canonical
+截至 2026-08-26，仓库已实现并验收 Core 的完整阶段二链路：严格 JSON/canonical
 边界、OpenAI tool-trajectory adapter、选择/quarantine、内存精确去重、
 DataPlugin pipeline、provenance 和 logical training view；`ctx.autodata`
 已提供注册表、运行 API、深冻结 DataContext、最小 typed events，以及
 `autodata_status`、`autodata_plugins`、`autodata_context` 只读工具。
 
-已验证：typecheck、17 项单元/生命周期测试、Node 22/24 Profile/tarball
-smoke 和 npm pack。尚未实现持久化、Controller/Evolver、动态候选代码、
-Python/ms-swift、训练、评测或 GPU；这些仍由后续阶段门控制。
+已验证：typecheck、27 项单元/fixture/lifecycle 测试、Node 22/24 Profile/tarball
+smoke 和 npm pack。新增验证覆盖旧 DataHarness fixture parity、插件重入和
+exact disposer、事件监听器失败 containment 与卸载、可选 DSH 服务缺失、
+agent-scoped 只读上下文，以及服务边界的未知/非法 run 请求。
+
+阶段二明确没有实现持久化、Controller/Evolver、动态候选代码、Python/ms-swift、
+训练、评测或 GPU；这些仍由后续阶段门控制。Gate 2 完成后停止，等待用户单独
+批准阶段三。
