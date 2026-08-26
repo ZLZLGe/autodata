@@ -129,8 +129,14 @@ provider route 为 `free-router`、API 为 `openai-responses`、base URL 为
 环境变量时在模型适配器和 Agent stack 装载前跳过，普通 `pnpm check` 也不会调用
 真实 API。Agent turn 限时 120 秒，整个 smoke 进程限时 180 秒；成功只在 Agent、
 Cordis Context 和临时目录均完成清理后报告。`FREEROUTER_API_KEY` 不传入候选
-Validator 子进程。离线测试只证明配置可被 DSH 接受和无凭据路径不会联网；真实
-模型未通过时不得宣称 Gate 3B 完成。
+Validator 子进程。smoke 组合 DSH 标准 `dsh-llm-retry` 执行器，使用 provider
+默认的有限策略处理瞬时 `TIMEOUT`、`RATE_LIMIT`、`SERVER`、`TRANSPORT` 和
+`EMPTY_RESPONSE`；若环境提供标准 `HTTP_PROXY`、`HTTPS_PROXY` 或小写等价
+变量，Node 请求通过 `EnvHttpProxyAgent` 遵循这些代理及 `NO_PROXY`，不会把
+代理地址或凭据写入结果。失败输出仅包含经白名单和脱敏处理的稳定错误码与消息；
+成功 JSON 记录已验证的工具调用顺序、候选状态与版本、实际启动的重试次数，以及
+所有 provider attempt 已报告的汇总 token usage。离线测试只证明配置可被 DSH
+接受和无凭据路径不会联网；真实模型未通过时不得宣称 Gate 3B 完成。
 
 Stage 3A 与 Stage 3B 分别形成可回滚提交，二者都通过后才宣布 Gate 3 完成。
 Stage 4 才通过 DSH `ctx.jobs` 接入 Python Trainer/Evaluator 和真实训练/GPU。

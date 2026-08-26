@@ -17,9 +17,9 @@ AutoData 是为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harne
 
 阶段二保持纯内存、单进程、同步模型；Stage 3A 已增加持久化 Controller、
 直接 JavaScript DataPlugin 提案、普通 Node 子进程验证、B_dev 接受/回滚和
-重启恢复；Stage 3B 已用确定性 fake model 驱动真实 DSH Agent/Session/Tool
-loop，并验证直接候选提交。真实 FreeRouter 模型 smoke 尚未运行。Python
-训练和 GPU 评测仍延后到 Stage 4。
+重启恢复；Stage 3B 已用确定性 fake model 和真实 FreeRouter 模型分别驱动
+DSH Agent/Session/Tool loop，并验证直接候选提交，Gate 3 已完成。Python 训练
+和 GPU 评测仍延后到 Stage 4。
 
 ## 阶段二（Gate 2 已完成）
 
@@ -58,9 +58,9 @@ Stage 3A/3B 按 [docs/stage3-evolution.md](docs/stage3-evolution.md) 实现：Au
 DataPlugin 候选、B_search 反馈、子进程验证、B_dev 接受/拒绝、回滚和重启
 恢复。生产 Bundle 使用 `AUTODATA_HOME`，未设置时回退到
 `$DSH_HOME/autodata`；两者都缺失时会明确失败。强模型复用当前 DSH Profile
-的 Agent、Session、Tool 和模型，直接提交 `host_source`；确定性 loop 验证已
-完成，真实模型 smoke 入口已实现但仍待可用凭据实际运行。训练、评测和 GPU 作业通过
-DSH `ctx.jobs` 在 Stage 4 接入。
+的 Agent、Session、Tool 和模型，直接提交 `host_source`；确定性 loop 与真实
+FreeRouter smoke 均已通过。训练、评测和 GPU 作业通过 DSH `ctx.jobs` 在
+Stage 4 接入。
 
 ### TaskProfile 初始化
 
@@ -119,7 +119,12 @@ FREEROUTER_API_KEY=... pnpm smoke:freerouter
 DataPlugin 候选。凭据只通过 `FREEROUTER_API_KEY` 环境变量引用；脚本不读取
 `auth.json`。变量缺失或为空时命令会在加载 Agent/模型适配器之前跳过并以 0
 退出，不会发出网络请求。普通 `pnpm check` 只做离线配置和跳过路径验证，不能
-据此声称真实模型 smoke 已通过。
+据此声称真实模型 smoke 已通过。若进程环境设置了标准 `HTTP_PROXY`、
+`HTTPS_PROXY` 或小写等价项，smoke 会让 Node 请求遵循这些代理及 `NO_PROXY`；
+代理地址和凭据都不会写入结果。DSH 的默认有限重试策略会处理瞬时超时、限流和
+传输错误。失败只打印脱敏后的稳定错误码与消息；成功 JSON 会记录工具调用顺序、
+候选状态和版本、实际启动的重试次数，以及所有 provider attempt 已报告的汇总
+token usage。
 
 ## 安装本地候选版本
 
