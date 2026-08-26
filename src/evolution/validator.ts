@@ -14,6 +14,27 @@ export const CANDIDATE_VALIDATION_SCHEMA_VERSION = 'autodata-candidate-validatio
 const DEFAULT_TIMEOUT_MS = 15_000
 const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024
 const VALIDATOR_OLD_SPACE_MIB = 128
+const WORKER_ENVIRONMENT_KEYS = new Set([
+  'APPDATA',
+  'COMSPEC',
+  'DYLD_LIBRARY_PATH',
+  'HOME',
+  'LANG',
+  'LC_ALL',
+  'LC_CTYPE',
+  'LD_LIBRARY_PATH',
+  'LOCALAPPDATA',
+  'NODE_PATH',
+  'PATH',
+  'PATHEXT',
+  'SYSTEMROOT',
+  'TEMP',
+  'TMP',
+  'TMPDIR',
+  'TZ',
+  'USERPROFILE',
+  'WINDIR',
+])
 
 export interface CandidateValidationResult {
   readonly schema_version: typeof CANDIDATE_VALIDATION_SCHEMA_VERSION
@@ -111,7 +132,7 @@ export class ProcessCandidateValidator implements CandidateValidator {
       ], {
         cwd: dirname(workerPath),
         detached,
-        env: process.env,
+        env: workerEnvironment(),
         stdio: ['pipe', 'pipe', 'pipe', 'pipe'],
       })
     } catch (error) {
@@ -231,6 +252,16 @@ export class ProcessCandidateValidator implements CandidateValidator {
       return failed(input.candidate_id, 'candidate validation worker returned a malformed result')
     }
   }
+}
+
+function workerEnvironment(environment: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const worker: NodeJS.ProcessEnv = {}
+  // The worker needs ordinary process locations and locale only. Model, Git,
+  // cloud, and package-manager credentials remain in the DSH host process.
+  for (const [key, value] of Object.entries(environment)) {
+    if (value !== undefined && WORKER_ENVIRONMENT_KEYS.has(key.toUpperCase())) worker[key] = value
+  }
+  return worker
 }
 
 function normalizeWorkerResult(value: unknown, candidateId: string): CandidateValidationResult {

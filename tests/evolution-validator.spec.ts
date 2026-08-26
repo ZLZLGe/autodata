@@ -222,4 +222,41 @@ describe('candidate process validator', () => {
       reason: expect.stringMatching(/signal SIGTERM/iu),
     })
   })
+
+  it('passes only ordinary runtime environment to the validation process', async () => {
+    const credentialNames = ['FREEROUTER_API_KEY', 'GITHUB_TOKEN', 'AWS_SECRET_ACCESS_KEY'] as const
+    const previous = new Map(credentialNames.map(name => [name, process.env[name]]))
+    for (const name of credentialNames) process.env[name] = `validator-test-${name.toLowerCase()}`
+    const credentialProbe = new ProcessCandidateValidator({
+      worker_url: workerScript(`
+        import { writeSync } from 'node:fs'
+        let text = ''
+        for await (const chunk of process.stdin) text += String(chunk)
+        const input = JSON.parse(text)
+        const credentials = ['FREEROUTER_API_KEY', 'GITHUB_TOKEN', 'AWS_SECRET_ACCESS_KEY']
+        if (credentials.some(name => process.env[name] !== undefined)) process.exit(9)
+        writeSync(3, JSON.stringify({
+          schema_version: 'autodata-candidate-validation-1',
+          candidate_id: input.candidate_id,
+          ok: true,
+          plugin_id: input.plugin_id,
+          plugin_version: input.plugin_version,
+        }) + '\\n')
+      `),
+    })
+
+    try {
+      await expect(credentialProbe.validate(profile, candidate('ignored'))).resolves.toMatchObject({
+        candidate_id: 'candidate-1',
+        ok: true,
+        plugin_id: 'bfcl-strategy',
+        plugin_version: '1',
+      })
+    } finally {
+      for (const [name, value] of previous) {
+        if (value === undefined) delete process.env[name]
+        else process.env[name] = value
+      }
+    }
+  })
 })

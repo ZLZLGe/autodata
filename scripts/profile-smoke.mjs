@@ -9,6 +9,7 @@ const dsh = resolve(root, 'node_modules', '.bin', process.platform === 'win32' ?
 const scratch = mkdtempSync(join(tmpdir(), 'autodata-profile-smoke-'))
 const packDirectory = join(scratch, 'pack')
 const home = join(scratch, 'dsh-home')
+const autodataHome = join(scratch, 'autodata-home')
 const ready = join(scratch, 'ready.json')
 const disposed = join(scratch, 'disposed')
 let child
@@ -93,6 +94,7 @@ try {
 
   const env = {
     ...process.env,
+    AUTODATA_HOME: autodataHome,
     DSH_HOME: home,
     DSH_TELEMETRY_DISABLED: '1',
   }
@@ -118,6 +120,20 @@ try {
   }
 
   const probe = join(scratch, 'probe.mjs')
+  const candidateSource = `
+    return {
+      inject: ['autodata'],
+      apply(ctx) {
+        ctx.autodata.register({
+          id: 'default-strategy',
+          version: '1',
+          run(input) {
+            return input.map(item => ({ record_id: item.record.source.record_id }))
+          },
+        })
+      },
+    }
+  `
   writeFileSync(probe, [
     "import { writeFileSync } from 'node:fs'",
     "export const name = 'autodata-smoke-probe'",
@@ -125,14 +141,33 @@ try {
     'export function apply(ctx) {',
     '  let active = true',
     '  const heartbeat = setInterval(() => {}, 1000)',
-    '  void ctx.loader.await().then(() => {',
+    '  const signal = new AbortController().signal',
+    '  const execute = (name, argumentsValue, callId) => ctx.tools.execute({',
+    '    signal, name, callId, arguments: argumentsValue,',
+    '  })',
+    '  void ctx.loader.await().then(async () => {',
     '    if (!active) return',
     "    const status = ctx.autodata.status()",
     "    const plugins = ctx.autodata.plugins()",
     "    const context = ctx.autodata.context()",
-    "    const visible = ctx.tools.schemas().some(schema => schema.name === 'autodata_status')",
-    "    const pluginsVisible = ctx.tools.schemas().some(schema => schema.name === 'autodata_plugins')",
-    '    writeFileSync(process.env.AUTODATA_SMOKE_READY, JSON.stringify({ status, plugins, context, visible, pluginsVisible }))',
+    '    const schemaNames = ctx.tools.schemas().map(schema => schema.name)',
+    "    const evolutionStatus = await execute('autodata_evolution_status', { profile_id: 'default' }, 'profile-status')",
+    "    const evolutionFeedback = await execute('autodata_evolution_feedback', { profile_id: 'default' }, 'profile-feedback')",
+    "    const candidate = await execute('autodata_submit_candidate', {",
+    "      profile_id: 'default',",
+    "      candidate_id: 'default-smoke-candidate',",
+    "      strategy_version: '1',",
+    `      host_source: ${JSON.stringify(candidateSource)},`,
+    "      capabilities: ['data-select', 'data-filter', 'data-order'],",
+    "    }, 'profile-candidate')",
+    '    if (!active) return',
+    '    writeFileSync(process.env.AUTODATA_SMOKE_READY, JSON.stringify({',
+    '      status, plugins, context, schemaNames, evolutionStatus, evolutionFeedback, candidate,',
+    '    }))',
+    '  }).catch(error => {',
+    '    writeFileSync(process.env.AUTODATA_SMOKE_READY, JSON.stringify({',
+    "      probeError: error instanceof Error ? error.stack : String(error),",
+    '    }))',
     '  })',
     '  ctx.effect(() => () => {',
     '    active = false',
@@ -168,13 +203,49 @@ try {
 
   await waitFor(ready, closed, 'AutoData ready marker')
   const observed = JSON.parse(readFileSync(ready, 'utf8'))
+  if (observed.probeError) throw new Error(`AutoData probe failed: ${observed.probeError}`)
   if (observed.status?.version !== '0.1.0-rc.1' || observed.status?.ready !== true) {
     throw new Error(`unexpected AutoData status: ${JSON.stringify(observed)}`)
   }
-  if (!observed.visible) throw new Error('autodata_status is not visible in the DSH tool schema list')
-  if (!observed.pluginsVisible) throw new Error('autodata_plugins is not visible in the DSH tool schema list')
+  for (const toolName of [
+    'autodata_status',
+    'autodata_plugins',
+    'autodata_evolution_status',
+    'autodata_evolution_feedback',
+    'autodata_submit_candidate',
+  ]) {
+    if (!observed.schemaNames?.includes(toolName)) throw new Error(`${toolName} is not visible in the DSH tool schema list`)
+  }
   if (observed.plugins?.[0]?.id !== 'toolcall-h0') throw new Error(`unexpected plugin snapshot: ${JSON.stringify(observed)}`)
   if (observed.context?.schema_version !== 'autodata-context-1') throw new Error(`unexpected context snapshot: ${JSON.stringify(observed)}`)
+  if (observed.evolutionStatus?.isError || observed.evolutionStatus?.value?.profile?.id !== 'default') {
+    throw new Error(`default evolution status failed: ${JSON.stringify(observed.evolutionStatus)}`)
+  }
+  if (observed.evolutionFeedback?.isError || observed.evolutionFeedback?.value?.feedback !== null) {
+    throw new Error(`default evolution feedback failed: ${JSON.stringify(observed.evolutionFeedback)}`)
+  }
+  if (observed.candidate?.isError || observed.candidate?.value?.validation?.ok !== true) {
+    throw new Error(`default candidate validation failed: ${JSON.stringify(observed.candidate)}`)
+  }
+
+  const defaultProfileDirectory = join(autodataHome, 'profiles', 'default')
+  const persistedProfile = JSON.parse(readFileSync(join(defaultProfileDirectory, 'profile.json'), 'utf8'))
+  const persistedState = JSON.parse(readFileSync(join(defaultProfileDirectory, 'state.json'), 'utf8'))
+  if (persistedProfile.benchmark !== 'autodata-fixture' || persistedProfile.acceptance_policy?.metric !== 'score') {
+    throw new Error(`unexpected persisted default Profile: ${JSON.stringify(persistedProfile)}`)
+  }
+  if (persistedState.active_candidate_id !== 'h0' || persistedState.open_candidate_id !== 'default-smoke-candidate') {
+    throw new Error(`unexpected persisted default state: ${JSON.stringify(persistedState)}`)
+  }
+  const persistedCandidate = persistedState.candidates?.find(entry => entry.candidate_id === 'default-smoke-candidate')
+  if (persistedCandidate?.status !== 'validated') {
+    throw new Error(`default candidate was not persisted as validated/open: ${JSON.stringify(persistedState)}`)
+  }
+  for (const candidateFile of ['manifest.json', 'package-host.js']) {
+    if (!existsSync(join(defaultProfileDirectory, 'candidates', 'default-smoke-candidate', candidateFile))) {
+      throw new Error(`default candidate is missing ${candidateFile}`)
+    }
+  }
 
   child.kill('SIGTERM')
   const result = await Promise.race([

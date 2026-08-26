@@ -11,10 +11,16 @@ import {
   type RegisteredDataRunRequest,
 } from './core/index.js'
 import { EvolutionController } from './evolution/controller.js'
+import { normalizeTaskProfile } from './evolution/profile.js'
 import { DshEvolutionRuntime, type EvolutionRuntime } from './evolution/runtime.js'
 import { FileEvolutionStore } from './evolution/store.js'
 import { ProcessCandidateValidator, type CandidateValidator } from './evolution/validator.js'
-import { EvolutionError, type EvolutionStore } from './evolution/types.js'
+import {
+  EvolutionError,
+  type EvolutionStore,
+  type TaskProfile,
+  type TaskProfileInput,
+} from './evolution/types.js'
 
 /** AutoData package version exposed by the Stage 1 service contract. */
 export const AUTODATA_VERSION = '0.1.0-rc.1'
@@ -55,10 +61,39 @@ interface RegisteredPlugin {
 }
 
 export interface AutoDataServiceOptions {
+  /** Immutable TaskProfiles owned by the Host configuration. */
+  readonly profiles?: readonly TaskProfileInput[]
   /** Explicit test seam. Production Bundle startup always uses FileEvolutionStore. */
   readonly store?: EvolutionStore
   readonly validator?: CandidateValidator
   readonly runtime?: EvolutionRuntime
+}
+
+/** The zero-configuration profile used only when the Store is initially empty. */
+export const DEFAULT_TASK_PROFILE: TaskProfile = normalizeTaskProfile({
+  id: 'default',
+  benchmark: 'autodata-fixture',
+  acceptance: { metric: 'score' },
+  capabilities: ['data-select', 'data-filter', 'data-order'],
+})
+
+interface ConfigValidationIssue {
+  readonly message: string
+  readonly path?: readonly PropertyKey[]
+}
+
+const AUTO_DATA_SERVICE_CONFIG = {
+  '~standard': {
+    version: 1 as const,
+    vendor: '@zlzlge/autodata',
+    validate(value: unknown): { value: AutoDataServiceOptions } | { issues: readonly ConfigValidationIssue[] } {
+      try {
+        return { value: normalizeServiceOptions(value) }
+      } catch (error) {
+        return { issues: [{ message: errorMessage(error) }] }
+      }
+    },
+  },
 }
 
 const evolutionControllers = new WeakMap<AutoDataService, EvolutionController>()
@@ -83,9 +118,12 @@ export function getEvolutionController(ctx: Context): EvolutionController {
 
 /** AutoData's in-memory data Core mounted into the shared DSH Cordis context. */
 export class AutoDataService extends Service {
+  static Config = AUTO_DATA_SERVICE_CONFIG
+
   private readonly registry = new Map<string, RegisteredPlugin>()
 
   constructor(ctx: Context, options: AutoDataServiceOptions = {}) {
+    options = normalizeServiceOptions(options)
     super(ctx, 'autodata')
     const h0 = snapshotPlugin(h0DataPlugin)
     this.registry.set(h0.descriptor.id, h0)
@@ -102,6 +140,11 @@ export class AutoDataService extends Service {
         evolutionControllers.delete(originalAutoDataService(this))
       }
     }, 'autodata.evolution-controller')
+
+    const existingProfiles = controller.profiles()
+    const configuredProfiles = options.profiles
+      ?? (existingProfiles.length === 0 ? [DEFAULT_TASK_PROFILE] : existingProfiles)
+    controller.ensureProfiles(configuredProfiles)
   }
 
   /** Return deterministic in-memory status without reading project or run data. */
@@ -216,6 +259,44 @@ export class AutoDataService extends Service {
     const agent = resolveAgent(this.ctx, request)
     return buildDataContext(this.ctx, agent, this.plugins())
   }
+}
+
+function normalizeServiceOptions(value: unknown): AutoDataServiceOptions {
+  if (value === undefined) value = {}
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new TypeError('AutoData service config must be an object')
+  }
+  const input = value as Record<string, unknown>
+  const allowed = new Set(['profiles', 'store', 'validator', 'runtime'])
+  const extra = Object.keys(input).find(key => !allowed.has(key))
+  if (extra !== undefined) throw new TypeError(`AutoData service config has unsupported field ${extra}`)
+
+  let profiles: readonly TaskProfile[] | undefined
+  if (input.profiles !== undefined) {
+    if (!Array.isArray(input.profiles) || input.profiles.length === 0) {
+      throw new TypeError('AutoData service config profiles must be a non-empty array')
+    }
+    profiles = Object.freeze(input.profiles.map((profile, index) => {
+      try {
+        return normalizeTaskProfile(profile as TaskProfileInput)
+      } catch (error) {
+        throw new TypeError(`AutoData service config profiles[${String(index)}]: ${errorMessage(error)}`, {
+          cause: error,
+        })
+      }
+    }))
+  }
+
+  return {
+    ...(profiles === undefined ? {} : { profiles }),
+    ...(input.store === undefined ? {} : { store: input.store as EvolutionStore }),
+    ...(input.validator === undefined ? {} : { validator: input.validator as CandidateValidator }),
+    ...(input.runtime === undefined ? {} : { runtime: input.runtime as EvolutionRuntime }),
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
 function snapshotPlugin(plugin: DataPlugin): RegisteredPlugin {

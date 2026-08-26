@@ -105,10 +105,11 @@ export function apply(ctx: Context): void {
     text: string
   }) => () => void } | undefined
   if (typeof systemPrompt?.section === 'function') {
+    const profileIds = getEvolutionController(ctx).profiles().map(profile => profile.id)
     systemPrompt.section({
       name: 'autodata:evolution-contract',
       order: 150,
-      text: AUTODATA_EVOLUTION_PROMPT,
+      text: `${AUTODATA_EVOLUTION_PROMPT} Available TaskProfile IDs: ${profileIds.join(', ')}.`,
     })
   }
 

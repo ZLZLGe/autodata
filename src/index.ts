@@ -2,6 +2,7 @@ export {
   AUTODATA_CAPABILITIES,
   AUTODATA_VERSION,
   AutoDataService,
+  DEFAULT_TASK_PROFILE,
   getEvolutionController,
   type AutoDataServiceOptions,
   type AutoDataStatus,

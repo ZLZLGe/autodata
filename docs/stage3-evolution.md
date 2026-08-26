@@ -21,6 +21,14 @@ AcceptancePolicy。capability 只记录候选意图和实验元数据，不是�
 外部 B_dev 报告；只有严格胜过当前 active 的候选才由 Controller 通过 DSH
 Dynamic Runner 正式加载。
 
+TaskProfile 由 Host 配置，模型不能创建或修改。首次启动且 Store 为空时，省略
+配置会创建内置 `default` Profile（`autodata-fixture`、指标 `score`、三项数据
+能力）；它只用于安装和基础闭环验证，没有真实 B_dev 时候选保持
+`validated/open`。正式 benchmark 通过 `autodata-service.config.profiles` 声明
+一个或多个不可变 Profile；显式列表不额外混入 `default`，相同配置重启复用
+已有历史，规则改变则必须创建新 ID。已有 Store 且省略配置时直接恢复其中的
+Profile，不创建第二套默认状态。
+
 ## Public Contract
 
 `ctx.autodata` 只公开候选需要的数据面，不公开 Controller 或 Store。可信 Host
@@ -114,7 +122,15 @@ resume，失败候选不影响旧 active。
 Gate 3B 的普通 CI 使用确定性 fake model 驱动真实 DSH Agent/Session/Tool loop。
 本地真实 smoke 使用 DSH 原生模型路由调用 FreeRouter 的 `gpt-5.6-sol`，从
 synthetic B_search 失败反馈生成并提交至少一个通过 Validator 的候选。凭据只从
-进程环境读取。真实模型未通过时不得宣称 Gate 3B 完成。
+进程环境读取。实现入口为 `FREEROUTER_API_KEY=... pnpm smoke:freerouter`，固定
+provider route 为 `free-router`、API 为 `openai-responses`、base URL 为
+`https://free-router.opendatalab.com/v1`，provider 和 model 的推理档位固定为
+`high`。脚本不加载 credentials/auth 文件；缺少
+环境变量时在模型适配器和 Agent stack 装载前跳过，普通 `pnpm check` 也不会调用
+真实 API。Agent turn 限时 120 秒，整个 smoke 进程限时 180 秒；成功只在 Agent、
+Cordis Context 和临时目录均完成清理后报告。`FREEROUTER_API_KEY` 不传入候选
+Validator 子进程。离线测试只证明配置可被 DSH 接受和无凭据路径不会联网；真实
+模型未通过时不得宣称 Gate 3B 完成。
 
 Stage 3A 与 Stage 3B 分别形成可回滚提交，二者都通过后才宣布 Gate 3 完成。
 Stage 4 才通过 DSH `ctx.jobs` 接入 Python Trainer/Evaluator 和真实训练/GPU。

@@ -109,6 +109,12 @@ async function setup() {
     validator: new ProcessCandidateValidator({
       worker_url: pathToFileURL(join(process.cwd(), 'lib/evolution/validator-worker.js')),
     }),
+    profiles: [{
+      id: 'agent-profile',
+      benchmark: 'fixture',
+      acceptance: { metric: 'accuracy' },
+      capabilities: ['data-select'],
+    }],
   })
   await ctx.plugin(AutoDataTool)
   await ctx.plugin(AgentLoop, { agents: [] })
@@ -136,12 +142,6 @@ describe('Stage 3B DSH Agent loop', () => {
     expect(process.env.DSH_TOOLS_MODE).toBe('native')
     const { ctx, adapter } = await setup()
     const controller = getEvolutionController(ctx)
-    controller.createProfile({
-      id: 'agent-profile',
-      benchmark: 'fixture',
-      acceptance: { metric: 'accuracy' },
-      capabilities: ['data-select'],
-    })
     controller.recordFeedback({
       schema_version: EVOLUTION_FEEDBACK_SCHEMA_VERSION,
       feedback_id: 'feedback-agent-loop',
@@ -179,6 +179,7 @@ describe('Stage 3B DSH Agent loop', () => {
       expect(turnEnd?.data.reason.kind).toBe('completed')
       expect(adapter.requests).toHaveLength(4)
       expect(adapter.requests[0]?.system).toContain('autodata_submit_candidate')
+      expect(adapter.requests[0]?.system).toContain('Available TaskProfile IDs: agent-profile.')
       expect(adapter.requests[0]?.system).toContain('Do not use cordis_define or cordis_run')
       for (const request of adapter.requests) {
         expect(request.tools?.map(tool => tool.name)).toEqual(expect.arrayContaining([

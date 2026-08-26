@@ -59,8 +59,38 @@ DataPlugin 候选、B_search 反馈、子进程验证、B_dev 接受/拒绝、�
 恢复。生产 Bundle 使用 `AUTODATA_HOME`，未设置时回退到
 `$DSH_HOME/autodata`；两者都缺失时会明确失败。强模型复用当前 DSH Profile
 的 Agent、Session、Tool 和模型，直接提交 `host_source`；确定性 loop 验证已
-完成，真实模型 smoke 仍待凭据与调用路径确认。训练、评测和 GPU 作业通过
+完成，真实模型 smoke 入口已实现但仍待可用凭据实际运行。训练、评测和 GPU 作业通过
 DSH `ctx.jobs` 在 Stage 4 接入。
+
+### TaskProfile 初始化
+
+人不必先写 TaskProfile。首次启动时，如果没有 `profiles` 配置且 Store 为空，
+AutoData 会创建内置的 `default` Profile：benchmark 为 `autodata-fixture`，接受
+指标为 `score`，候选能力为 `data-select`、`data-filter` 和 `data-order`。它用于
+开箱验证；因为没有真实 B_dev 报告，候选最多保持 `validated/open`，不会自动
+冒充已接受版本。
+
+正式 benchmark 应由 Host 在 DSH Profile 的 `cordis.patch.yml` 中覆盖
+`autodata-service` 配置，例如：
+
+```yaml
+- id: autodata-service
+  config:
+    profiles:
+      - id: bfcl-v4
+        benchmark: bfcl-v4
+        acceptance:
+          metric: accuracy
+        capabilities:
+          - data-select
+          - data-filter
+          - data-order
+```
+
+显式 `profiles` 列表不会额外创建 `default`；`strategy_plugin_id` 省略时默认为
+`<profile-id>-strategy`。Profile 创建后不可变，相同配置重启会复用已有状态，
+修改 benchmark、指标、能力或策略 ID 必须使用新的 Profile ID。配置不会删除
+Store 中已有的历史 Profile，模型也没有创建或修改 Profile 的工具。
 
 ## 环境要求
 
@@ -77,6 +107,19 @@ pnpm check
 ```
 
 `pnpm test:profile` 会在临时目录中构建包 tarball，将其安装到隔离的 DSH Profile（配置档案）中，验证服务和工具，并确认关闭时能够干净销毁。它不会调用模型 API。
+
+真实模型 smoke 是显式选择加入的本地检查，不属于 `pnpm check`：
+
+```sh
+FREEROUTER_API_KEY=... pnpm smoke:freerouter
+```
+
+该命令通过 DSH 的 `llm-pi-ai`、Agent、Session 和 Tool loop 调用固定的
+`free-router/gpt-5.6-sol` 路由，从 synthetic B_search 反馈生成并验证一个
+DataPlugin 候选。凭据只通过 `FREEROUTER_API_KEY` 环境变量引用；脚本不读取
+`auth.json`。变量缺失或为空时命令会在加载 Agent/模型适配器之前跳过并以 0
+退出，不会发出网络请求。普通 `pnpm check` 只做离线配置和跳过路径验证，不能
+据此声称真实模型 smoke 已通过。
 
 ## 安装本地候选版本
 

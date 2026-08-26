@@ -14,6 +14,7 @@ import {
   type TaskProfile,
   type TaskProfileInput,
 } from './types.js'
+import { canonicalJson } from '../core/json.js'
 import {
   normalizeEvolutionFeedback,
   normalizeTaskProfile,
@@ -89,6 +90,78 @@ export class EvolutionController {
     }
     this.store.createProfile(profile)
     return this.status(profile.id)
+  }
+
+  /**
+   * Ensure immutable Host-configured profiles exist without changing the
+   * createProfile() collision contract used by explicit callers.
+   */
+  ensureProfiles(inputs: readonly (TaskProfileInput | TaskProfile)[]): readonly EvolutionStatus[] {
+    this.assertUsable()
+    if (!Array.isArray(inputs) || inputs.length === 0) {
+      throw new EvolutionError('at least one TaskProfile must be configured', 'INVALID_PROFILE')
+    }
+
+    // Normalize and cross-check the complete requested set before creating
+    // anything. A later config error must not leave an earlier profile behind.
+    const profiles = inputs.map(input => normalizeTaskProfile(input))
+    const requestedIds = new Set<string>()
+    const requestedStrategies = new Map<string, string>()
+    for (const profile of profiles) {
+      if (requestedIds.has(profile.id)) {
+        throw new EvolutionError(`profile ${profile.id} is configured more than once`, 'INVALID_PROFILE', {
+          profile_id: profile.id,
+        })
+      }
+      requestedIds.add(profile.id)
+      const owner = requestedStrategies.get(profile.strategy_plugin_id)
+      if (owner !== undefined) {
+        throw new EvolutionError(
+          `strategy_plugin_id ${profile.strategy_plugin_id} is configured for both ${owner} and ${profile.id}`,
+          'INVALID_PROFILE',
+          { profile_id: profile.id },
+        )
+      }
+      requestedStrategies.set(profile.strategy_plugin_id, profile.id)
+    }
+
+    const existing = this.store.listProfiles()
+    const existingById = new Map(existing.map(profile => [profile.id, profile]))
+    const existingByStrategy = new Map(existing.map(profile => [profile.strategy_plugin_id, profile]))
+
+    // Existing profiles are part of the model-visible runtime surface. Check
+    // their complete state before accepting new configuration.
+    for (const profile of existing) this.store.loadConsistentSnapshot(profile.id)
+
+    for (const profile of profiles) {
+      const current = existingById.get(profile.id)
+      if (current !== undefined && !sameProfile(current, profile)) {
+        throw new EvolutionError(
+          `profile ${profile.id} already exists with different immutable configuration`,
+          'PROFILE_EXISTS',
+          { profile_id: profile.id },
+        )
+      }
+      const strategyOwner = existingByStrategy.get(profile.strategy_plugin_id)
+      if (strategyOwner !== undefined && strategyOwner.id !== profile.id) {
+        throw new EvolutionError(
+          `strategy_plugin_id ${profile.strategy_plugin_id} is already owned by profile ${strategyOwner.id}`,
+          'INVALID_PROFILE',
+          { profile_id: profile.id },
+        )
+      }
+    }
+
+    for (const profile of profiles) {
+      if (!existingById.has(profile.id)) this.store.createProfile(profile)
+    }
+    return Object.freeze(profiles.map(profile => this.status(profile.id)))
+  }
+
+  /** Return immutable TaskProfiles in their stable Store order. */
+  profiles(): readonly TaskProfile[] {
+    this.assertUsable()
+    return this.store.listProfiles()
   }
 
   /** Persist a new direct host-source proposal. Validation is a separate step. */
@@ -374,4 +447,8 @@ export class EvolutionController {
   private assertUsable(): void {
     if (this.disposed) throw new EvolutionError('AutoData evolution controller is disposed', 'RUNTIME_UNAVAILABLE')
   }
+}
+
+function sameProfile(left: TaskProfile, right: TaskProfile): boolean {
+  return canonicalJson(left) === canonicalJson(right)
 }
