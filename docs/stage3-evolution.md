@@ -23,20 +23,25 @@ Dynamic Runner 正式加载。
 
 ## Public Contract
 
-Host API 挂载在 `ctx.autodata.evolution`：
+`ctx.autodata` 只公开候选需要的数据面，不公开 Controller 或 Store。可信 Host
+代码通过包导出的 `getEvolutionController(ctx)` 取得控制面：
 
 ```ts
-createProfile(profile)
-submitCandidate(profileId, candidate)
-validateCandidate(profileId, candidateId)
-recordFeedback(feedback)
-feedback(profileId, feedbackId?)
-recordEvaluation(report, agent)
-status(profileId)
-rollback(profileId, candidateId, agent)
-resume(profileId, agent)
-dispose()
+const evolution = getEvolutionController(ctx)
+evolution.createProfile(profile)
+evolution.submitCandidate(profileId, candidate)
+evolution.validateCandidate(profileId, candidateId)
+evolution.recordFeedback(feedback)
+evolution.feedback(profileId, feedbackId?)
+evolution.recordEvaluation(report, agent)
+evolution.status(profileId)
+evolution.rollback(profileId, candidateId, agent)
+evolution.resume(profileId, agent)
 ```
+
+Controller 由模块私有 `WeakMap` 绑定到 `AutoDataService`。AutoData 自己的工具
+使用同一个内部 accessor；Dynamic Runner 中的候选即使注入 `autodata`，也只能
+调用 `register`、`run`、`plugins` 等数据能力，不能绕过工具直接写演化状态。
 
 正式提交直接携带 `candidate_id`、`strategy_version`、`host_source`，以及可选的
 `description`、`capabilities` 和 `metadata`。不保存临时 DSH Plugin/Package ID，
