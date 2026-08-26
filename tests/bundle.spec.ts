@@ -27,12 +27,15 @@ describe('AutoData bundle manifest', () => {
     expect(manifest.files).toEqual(expect.arrayContaining(['lib', 'cordis.patch.yml', 'README.md', 'LICENSE']))
     expect(manifest.exports).toHaveProperty('./service')
     expect(manifest.exports).toHaveProperty('./tool')
+    expect(manifest.exports).toHaveProperty('./evolution')
   })
 
   it('declares only the DSH APIs imported at runtime as exact peers', () => {
     expect(manifest.dependencies).toBeUndefined()
     expect(manifest.peerDependencies).toEqual({
       '@deepseek-ai/cordis': '4.0.1',
+      '@deepseek-ai/dsh-cordis-host-runner': '0.1.1-rc.2',
+      '@deepseek-ai/dsh-system-prompt': '0.1.1-rc.2',
       '@deepseek-ai/dsh-tools': '0.1.1-rc.2',
     })
   })

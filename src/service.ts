@@ -10,6 +10,11 @@ import {
   type DataRunResult,
   type RegisteredDataRunRequest,
 } from './core/index.js'
+import { EvolutionController } from './evolution/controller.js'
+import { DshEvolutionRuntime, type EvolutionRuntime } from './evolution/runtime.js'
+import { FileEvolutionStore } from './evolution/store.js'
+import { ProcessCandidateValidator, type CandidateValidator } from './evolution/validator.js'
+import { EvolutionError, type EvolutionStore } from './evolution/types.js'
 
 /** AutoData package version exposed by the Stage 1 service contract. */
 export const AUTODATA_VERSION = '0.1.0-rc.1'
@@ -19,6 +24,9 @@ export const AUTODATA_CAPABILITIES = Object.freeze([
   'autodata_status',
   'autodata_plugins',
   'autodata_context',
+  'autodata_evolution_status',
+  'autodata_evolution_feedback',
+  'autodata_submit_candidate',
 ] as const)
 
 /** A read-only snapshot of the live AutoData service. */
@@ -46,14 +54,54 @@ interface RegisteredPlugin {
   readonly plugin: DataPlugin
 }
 
+export interface AutoDataServiceOptions {
+  /** Explicit test seam. Production Bundle startup always uses FileEvolutionStore. */
+  readonly store?: EvolutionStore
+  readonly validator?: CandidateValidator
+  readonly runtime?: EvolutionRuntime
+}
+
+const evolutionControllers = new WeakMap<AutoDataService, EvolutionController>()
+const CORDIS_ORIGINAL = Symbol.for('cordis.original')
+
+function originalAutoDataService(service: AutoDataService): AutoDataService {
+  const original = (service as unknown as Record<symbol, unknown>)[CORDIS_ORIGINAL]
+  return (original ?? service) as AutoDataService
+}
+
+/** Trusted Host accessor. The Controller is deliberately absent from ctx.autodata. */
+export function getEvolutionController(ctx: Context): EvolutionController {
+  const service = ctx.get('autodata', false) as AutoDataService | undefined
+  const controller = service === undefined
+    ? undefined
+    : evolutionControllers.get(originalAutoDataService(service))
+  if (controller === undefined) {
+    throw new EvolutionError('AutoData evolution controller is unavailable', 'RUNTIME_UNAVAILABLE')
+  }
+  return controller
+}
+
 /** AutoData's in-memory data Core mounted into the shared DSH Cordis context. */
 export class AutoDataService extends Service {
   private readonly registry = new Map<string, RegisteredPlugin>()
 
-  constructor(ctx: Context) {
+  constructor(ctx: Context, options: AutoDataServiceOptions = {}) {
     super(ctx, 'autodata')
     const h0 = snapshotPlugin(h0DataPlugin)
     this.registry.set(h0.descriptor.id, h0)
+    const controller = new EvolutionController({
+      store: options.store ?? new FileEvolutionStore(),
+      validator: options.validator ?? new ProcessCandidateValidator(),
+      runtime: options.runtime ?? new DshEvolutionRuntime(ctx, this),
+    })
+    evolutionControllers.set(originalAutoDataService(this), controller)
+    this.ctx.effect(() => async () => {
+      try {
+        await controller.dispose()
+      } finally {
+        evolutionControllers.delete(originalAutoDataService(this))
+      }
+    }, 'autodata.evolution-controller')
   }
 
   /** Return deterministic in-memory status without reading project or run data. */

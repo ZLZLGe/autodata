@@ -2,6 +2,8 @@ export {
   AUTODATA_CAPABILITIES,
   AUTODATA_VERSION,
   AutoDataService,
+  getEvolutionController,
+  type AutoDataServiceOptions,
   type AutoDataStatus,
 } from './service.js'
 export {
@@ -41,4 +43,5 @@ export {
   validateOpenAiToolTrajectory,
 } from './core/index.js'
 export type * from './core/types.js'
+export * from './evolution/index.js'
 export { default } from './service.js'

@@ -15,9 +15,10 @@ AutoData 是为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harne
   logical training view；
 - 深冻结的 DSH 上下文只读投影与插件生命周期事件。
 
-阶段二保持纯内存、单进程、同步模型；Stage 3 正在增加持久化 Controller、
-直接 JavaScript DataPlugin 提案和 DSH Agent 闭环。Python 训练和 GPU 评测
-仍延后到 Stage 4。
+阶段二保持纯内存、单进程、同步模型；Stage 3A 已增加持久化 Controller、
+直接 JavaScript DataPlugin 提案、普通 Node 子进程验证、B_dev 接受/回滚和
+重启恢复。Stage 3B 的真实 DSH Agent/模型闭环尚未完成。Python 训练和 GPU
+评测仍延后到 Stage 4。
 
 ## 阶段二（Gate 2 已完成）
 
@@ -46,16 +47,18 @@ const result = ctx.autodata.run({
 日志的唯一权威。
 
 阶段二保持单进程、同步、内存模型，不写磁盘，也不引入锁、CAS、运行时哈希链、
-动态任意代码加载、Controller、训练或 GPU。阶段二 Gate 通过后会暂停，另行
-审批持久化和自进化 Controller；当前已在 Gate 2 停止。
+动态任意代码加载、Controller、训练或 GPU。阶段二 Gate 已通过；其内存 Core
+不负责 Stage 3 的持久化状态。
 
 ## 阶段三（Controller 与 DSH 动态候选）
 
-Stage 3 按 [docs/stage3-evolution.md](docs/stage3-evolution.md) 实现：AutoData
+Stage 3A 按 [docs/stage3-evolution.md](docs/stage3-evolution.md) 实现：AutoData
 使用 TypeScript/Node Controller 管理 TaskProfile、host-only JavaScript
 DataPlugin 候选、B_search 反馈、子进程验证、B_dev 接受/拒绝、回滚和重启
-恢复。强模型复用当前 DSH Profile 的 Agent、Session、Tool 和模型，直接提交
-`host_source`；训练、评测和 GPU 作业通过 DSH `ctx.jobs` 在 Stage 4 接入。
+恢复。生产 Bundle 使用 `AUTODATA_HOME`，未设置时回退到
+`$DSH_HOME/autodata`；两者都缺失时会明确失败。强模型复用当前 DSH Profile
+的 Agent、Session、Tool 和模型，直接提交 `host_source`；Stage 3B 的 Agent
+闭环仍待完成，训练、评测和 GPU 作业通过 DSH `ctx.jobs` 在 Stage 4 接入。
 
 ## 环境要求
 

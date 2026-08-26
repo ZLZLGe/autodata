@@ -4,6 +4,7 @@ import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import { describe, expect, it } from 'vitest'
 import AutoDataService from '../src/service.js'
+import { MemoryEvolutionStore } from '../src/evolution/store.js'
 import * as AutoDataStatusTool from '../src/tool.js'
 import type { DataPlugin, SourceAdapter } from '../src/core/types.js'
 
@@ -13,7 +14,7 @@ async function setup() {
   const ctx = new Context()
   await ctx.plugin(SystemPrompt)
   await ctx.plugin(ToolRuntime)
-  const serviceFiber = await ctx.plugin(AutoDataService)
+  const serviceFiber = await ctx.plugin(AutoDataService, { store: new MemoryEvolutionStore() })
   const toolFiber = await ctx.plugin(AutoDataStatusTool)
   return { ctx, serviceFiber, toolFiber }
 }
@@ -44,7 +45,14 @@ describe('AutoData DSH lifecycle', () => {
     expect(ctx.autodata.status()).toEqual({
       version: '0.1.0-rc.1',
       ready: true,
-      capabilities: ['autodata_status', 'autodata_plugins', 'autodata_context'],
+      capabilities: [
+        'autodata_status',
+        'autodata_plugins',
+        'autodata_context',
+        'autodata_evolution_status',
+        'autodata_evolution_feedback',
+        'autodata_submit_candidate',
+      ],
     })
     await ctx.fiber.dispose()
   })
@@ -69,11 +77,18 @@ describe('AutoData DSH lifecycle', () => {
       value: {
         version: '0.1.0-rc.1',
         ready: true,
-        capabilities: ['autodata_status', 'autodata_plugins', 'autodata_context'],
+        capabilities: [
+          'autodata_status',
+          'autodata_plugins',
+          'autodata_context',
+          'autodata_evolution_status',
+          'autodata_evolution_feedback',
+          'autodata_submit_candidate',
+        ],
       },
       content: [{
         type: 'text',
-      text: 'AutoData 0.1.0-rc.1 is ready. Capabilities: autodata_status, autodata_plugins, autodata_context.',
+      text: 'AutoData 0.1.0-rc.1 is ready. Capabilities: autodata_status, autodata_plugins, autodata_context, autodata_evolution_status, autodata_evolution_feedback, autodata_submit_candidate.',
       }],
     })
     await ctx.fiber.dispose()
@@ -90,6 +105,8 @@ describe('AutoData DSH lifecycle', () => {
     expect(ctx.get('autodata')).toBeUndefined()
     expect(ctx.tools.get('autodata_plugins')).toBeUndefined()
     expect(ctx.tools.get('autodata_context')).toBeUndefined()
+    expect(ctx.tools.get('autodata_evolution_status')).toBeUndefined()
+    expect(ctx.tools.get('autodata_submit_candidate')).toBeUndefined()
     await ctx.fiber.dispose()
   })
 
@@ -99,7 +116,7 @@ describe('AutoData DSH lifecycle', () => {
     expect(ctx.get('autodata')).toBeUndefined()
     expect(ctx.tools.get('autodata_status')).toBeUndefined()
 
-    await ctx.plugin(AutoDataService)
+    await ctx.plugin(AutoDataService, { store: new MemoryEvolutionStore() })
     expect(ctx.get('autodata')).toBeDefined()
     expect(ctx.tools.get('autodata_status')).toBeDefined()
     await ctx.fiber.dispose()
@@ -341,7 +358,7 @@ describe('AutoData DSH lifecycle', () => {
 
   it('starts without optional DSH services and projects an explicit agent scope', async () => {
     const ctx = new Context()
-    const serviceFiber = await ctx.plugin(AutoDataService)
+    const serviceFiber = await ctx.plugin(AutoDataService, { store: new MemoryEvolutionStore() })
     const context = ctx.autodata.context({
       agent: {
         id: 'agent-fixture',
