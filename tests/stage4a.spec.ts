@@ -11,6 +11,7 @@ import {
   STAGE4A_BFCL_CASES,
   STAGE4A_EVAL_RESULT_VERSION,
   STAGE4A_EXPECTED_PARAMETERS,
+  STAGE4A_CONTAINER_IMAGE,
   STAGE4A_MODEL_REVISION,
   STAGE4A_TOOL_CALL_PARSER,
   STAGE4A_TRAIN_RESULT_VERSION,
@@ -411,6 +412,16 @@ describe('Stage 4A Host controller', () => {
 })
 
 describe('Stage 4A RJob CLI adapter', () => {
+  it('treats the real CLI empty successful lookup as a missing RJob', async () => {
+    const client = new Stage4ARJobClient({
+      async run(argv) { return command(argv) },
+    })
+    await expect(client.inspect('autodata-missing-train', new AbortController().signal)).resolves.toMatchObject({
+      status: 'missing',
+      command: { argv: ['rjob', 'get', 'autodata-missing-train'] },
+    })
+  })
+
   it('uses argv execution, fixed bash entry, and requires predict-only 1/1', async () => {
     const calls: readonly string[][] = []
     const mutable = calls as string[][]
@@ -430,17 +441,79 @@ describe('Stage 4A RJob CLI adapter', () => {
     await client.dryRun(spec, new AbortController().signal)
     await client.predict(spec, new AbortController().signal)
     await client.submit(spec, new AbortController().signal)
-    expect(calls.map(argv => argv.slice(argv.indexOf('--')))).toEqual([
-      ['--', '/bin/bash', '/gpfs/gate/train.sh'],
-      ['--', '/bin/bash', '/gpfs/gate/train.sh'],
-      ['--', '/bin/bash', '/gpfs/gate/train.sh'],
+    const base = [
+      'rjob', 'submit',
+      '--name', 'autodata-gate-train',
+      '--folder', '/gpfs/gate',
+      '--metadata-name', 'autodata-gate-train',
+      '--task_name', 'train',
+      '--charged-group', 'cl4mind_gpu',
+      '--restart-policy', 'never',
+      '--backoff_limit', '1',
+      '--preemptible', 'no',
+      '--private-machine', 'group',
+      '--image', STAGE4A_CONTAINER_IMAGE,
+      '--replicas', '1', '--gpu', '4', '--cpu', '64', '--memory', '327680',
+      '--mount',
+      'gpfs://gpfs1/gezhilong:/mnt/shared-storage-user/gezhilong',
+      'gpfs://gpfs2/gpfs2-shared-public:/mnt/shared-storage-gpfs2/gpfs2-shared-public',
+      '--set-env', 'AUTODATA_STAGE4A_REQUEST=/gpfs/gate/attempts/train/0001/request.json',
+    ]
+    const entrypoint = ['--', '/bin/bash', '/gpfs/gate/train.sh']
+    expect(calls).toEqual([
+      [...base, '--dry-run', 'true', ...entrypoint],
+      [...base, '--predict-only', 'true', ...entrypoint],
+      [...base, ...entrypoint],
     ])
-    expect(calls[0]).toContain('Never')
     expect(calls[0]).not.toContain('-c')
 
     const unschedulable = new Stage4ARJobClient({
       async run(argv) { return command(argv, 'schedulable 0/1') },
     })
     await expect(unschedulable.predict(spec, new AbortController().signal)).rejects.toMatchObject({ code: 'UNSCHEDULABLE' })
+
+    const currentCli = new Stage4ARJobClient({
+      async run(argv) {
+        return command(argv, [
+          '📊 任务数量统计：',
+          '  - 总副本数量：1',
+          '  - 可调度数量：1',
+          '  - 不可调度数量：0',
+        ].join('\n'))
+      },
+    })
+    await expect(currentCli.predict(spec, new AbortController().signal)).resolves.toBeDefined()
+
+    const currentCliUnschedulable = new Stage4ARJobClient({
+      async run(argv) {
+        return command(argv, [
+          '  - 总副本数量：1',
+          '  - 可调度数量：0',
+          '  - 不可调度数量：1',
+        ].join('\n'))
+      },
+    })
+    await expect(currentCliUnschedulable.predict(spec, new AbortController().signal)).rejects.toMatchObject({ code: 'UNSCHEDULABLE' })
+  })
+
+  it('uses the frozen single-H200 resources for evaluation', async () => {
+    let captured: readonly string[] = []
+    const client = new Stage4ARJobClient({
+      async run(argv) {
+        captured = argv
+        return command(argv)
+      },
+    })
+    await client.dryRun({
+      stage: 'eval',
+      rjob_name: 'autodata-gate-eval',
+      staging_directory: '/gpfs/gate',
+      script_path: '/gpfs/gate/eval.sh',
+      request_path: '/gpfs/gate/attempts/eval/0001/request.json',
+    }, new AbortController().signal)
+    expect(captured).toContain('eval')
+    expect(captured.slice(captured.indexOf('--replicas'), captured.indexOf('--mount'))).toEqual([
+      '--replicas', '1', '--gpu', '1', '--cpu', '16', '--memory', '81920',
+    ])
   })
 })

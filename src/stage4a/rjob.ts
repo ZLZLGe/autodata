@@ -13,6 +13,12 @@ import {
 } from './types.js'
 
 const MAX_COMMAND_OUTPUT_BYTES = 2 * 1024 * 1024
+const STAGE4A_CHARGED_GROUP = 'cl4mind_gpu'
+const STAGE4A_PRIVATE_MACHINE = 'group'
+const STAGE4A_MOUNTS = Object.freeze([
+  'gpfs://gpfs1/gezhilong:/mnt/shared-storage-user/gezhilong',
+  'gpfs://gpfs2/gpfs2-shared-public:/mnt/shared-storage-gpfs2/gpfs2-shared-public',
+] as const)
 
 export interface Stage4ACommandRunner {
   run(argv: readonly string[], cwd: string, signal?: AbortSignal): Promise<Stage4ACommandResult>
@@ -62,13 +68,17 @@ function submissionArgv(spec: Stage4ARJobSpec, mode?: 'dry-run' | 'predict-only'
   return Object.freeze([
     'rjob', 'submit',
     '--name', spec.rjob_name,
+    '--folder', spec.staging_directory,
     '--metadata-name', spec.rjob_name,
-    '--task-name', spec.stage,
-    '--restart-policy', 'Never',
-    '--backoff_limit', '0',
+    '--task_name', spec.stage,
+    '--charged-group', STAGE4A_CHARGED_GROUP,
+    '--restart-policy', 'never',
+    '--backoff_limit', '1',
     '--preemptible', 'no',
+    '--private-machine', STAGE4A_PRIVATE_MACHINE,
     '--image', STAGE4A_CONTAINER_IMAGE,
     ...resources(spec.stage),
+    '--mount', ...STAGE4A_MOUNTS,
     '--set-env', `AUTODATA_STAGE4A_REQUEST=${spec.request_path}`,
     ...(mode === undefined ? [] : [`--${mode}`, 'true']),
     '--', '/bin/bash', spec.script_path,
@@ -79,6 +89,17 @@ function assertSuccess(result: Stage4ACommandResult, code: 'DRY_RUN_FAILED' | 'U
   if (result.exit_code !== 0 || result.signal !== null) {
     throw new Stage4AError(`${label} failed with exit ${String(result.exit_code)}${result.signal === null ? '' : `/${result.signal}`}`, code)
   }
+}
+
+function isFullySchedulable(output: string): boolean {
+  if (/(?:^|\D)1\s*\/\s*1(?:\D|$)/u.test(output)) return true
+  const count = (label: string): number | undefined => {
+    const match = output.match(new RegExp(`^\\s*-\\s*${label}\\s*[:：]\\s*(\\d+)\\s*$`, 'mu'))
+    return match?.[1] === undefined ? undefined : Number(match[1])
+  }
+  return count('总副本数量') === 1
+    && count('可调度数量') === 1
+    && count('不可调度数量') === 0
 }
 
 /** Concrete backend for the installed `rjob` CLI. */
@@ -103,7 +124,7 @@ export class Stage4ARJobClient implements Stage4ARJobBackend {
     const result = await this.runner.run(submissionArgv(spec, 'predict-only'), spec.staging_directory, signal)
     assertSuccess(result, 'UNSCHEDULABLE', `${spec.stage} RJob prediction`)
     const combined = `${result.stdout}\n${result.stderr}`
-    if (!/(?:^|\D)1\s*\/\s*1(?:\D|$)/u.test(combined)) {
+    if (!isFullySchedulable(combined)) {
       throw new Stage4AError(`${spec.stage} RJob prediction was not schedulable 1/1`, 'UNSCHEDULABLE')
     }
     return result
@@ -124,6 +145,7 @@ export class Stage4ARJobClient implements Stage4ARJobBackend {
       }
       throw new Stage4AError(`rjob get failed for ${rjobName}`, 'REMOTE_FAILED')
     }
+    if (output.trim() === '') return Object.freeze({ status: 'missing', command: result })
     let status: Stage4ARJobObservation['status'] = 'pending'
     if (/\b(succeeded|completed|success)\b/iu.test(output)) status = 'succeeded'
     else if (/\b(failed|error)\b/iu.test(output)) status = 'failed'

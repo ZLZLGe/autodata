@@ -15,8 +15,12 @@ H200 作业，不能据此宣称 Gate 4A 已通过。
 - eval 固定使用 1 张 H200、vLLM `0.19.1`、`qwen3_coder` parser 和仓库内五个
   BFCL case。
 - 每个阶段严格执行 `rjob submit --dry-run true`、
-  `rjob submit --predict-only true`（必须报告 `1/1`），最后才正式 submit。远端
+  `rjob submit --predict-only true`（必须报告 `1/1`，或新版 CLI 等价的总数 1、
+  可调度 1、不可调度 0），最后才正式 submit。远端
   入口始终是 `/bin/bash <staged-script>`，不使用 shell 拼接命令。
+- RJob 固定使用 `cl4mind_gpu` charged group、`group` private-machine、非抢占、
+  `backoff_limit=1`，并挂载用户 GPFS 与公共模型 GPFS。`--metadata-name` 与
+  确定性 RJob 名相同，`--name` 只作为 showname；恢复和取消始终按 metadata name。
 - Stage 4A 只验证兼容性，不调用 Stage 3 的 `recordEvaluation()`，也不修改
   active/champion。
 
