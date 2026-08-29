@@ -422,6 +422,21 @@ describe('Stage 4A RJob CLI adapter', () => {
     })
   })
 
+  it('reads only the RJob summary status and ignores zero-valued task counters', async () => {
+    const outputs = [
+      "08-30 04:28:02 [INFO] rjob autodata-gate-train (showname=): Inqueue\n08-30 04:28:02 [INFO]   |- task train: 1 replicas {'active': 0, 'succeeded': 0, 'failed': 0}",
+      "08-30 04:29:02 [INFO] rjob autodata-gate-train (showname=gate): Running\n08-30 04:29:02 [INFO]   |- task train: 1 replicas {'active': 1, 'succeeded': 0, 'failed': 0}",
+      "08-30 04:30:02 [INFO] rjob autodata-gate-train (showname=gate): Succeeded\n08-30 04:30:02 [INFO]   |- task train: 1 replicas {'active': 0, 'succeeded': 1, 'failed': 0}",
+    ]
+    let call = 0
+    const client = new Stage4ARJobClient({
+      async run(argv) { return command(argv, outputs[call++] as string) },
+    })
+    await expect(client.inspect('autodata-gate-train', new AbortController().signal)).resolves.toMatchObject({ status: 'pending' })
+    await expect(client.inspect('autodata-gate-train', new AbortController().signal)).resolves.toMatchObject({ status: 'running' })
+    await expect(client.inspect('autodata-gate-train', new AbortController().signal)).resolves.toMatchObject({ status: 'succeeded' })
+  })
+
   it('uses argv execution, fixed bash entry, and requires predict-only 1/1', async () => {
     const calls: readonly string[][] = []
     const mutable = calls as string[][]

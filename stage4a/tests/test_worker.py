@@ -7,12 +7,15 @@ from pathlib import Path
 
 from autodata_stage4a.worker import (
     CASE_IDS,
+    LOGICAL_VERSION,
     MODEL_ID,
     MODEL_PATH,
     MODEL_REVISION,
+    RUN_SUMMARY_VERSION,
     TRAIN_REQUEST_VERSION,
     _response_calls,
     _validate_train_request,
+    prepare_train,
 )
 
 
@@ -75,6 +78,33 @@ class WorkerContractTest(unittest.TestCase):
             [{"one": '{"a":1,"b":2}'}, {"two": '{"x":3}'}],
         )
         self.assertEqual(len(CASE_IDS), 5)
+
+    def test_prepare_train_uses_ms_swift_overlength_deletion_spelling(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "stage-four-a"
+            path = self._request(root)
+            (root / "run-summary.json").write_text(json.dumps({
+                "summary_version": RUN_SUMMARY_VERSION,
+                "counts": {"logical_training_units": 1},
+            }), encoding="utf-8")
+            (root / "logical-view.jsonl").write_text(json.dumps({
+                "schema_version": LOGICAL_VERSION,
+                "id": "record-one:assistant:1",
+                "source": {
+                    "adapter_id": "fixture", "adapter_version": "1",
+                    "dataset_id": "fixture", "dataset_revision": "1",
+                    "record_id": "record-one", "record_index": 0, "record_line": 1,
+                },
+                "assistant_message_index": 1,
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "hi", "loss": True},
+                ],
+                "tools": [], "selection_rank": 0, "plugin_provenance": [],
+            }) + "\n", encoding="utf-8")
+            self.assertEqual(prepare_train(path), 0)
+            config = json.loads((path.parent / "train-config.json").read_text(encoding="utf-8"))
+            self.assertEqual(config["truncation_strategy"], "delete")
 
 
 if __name__ == "__main__":

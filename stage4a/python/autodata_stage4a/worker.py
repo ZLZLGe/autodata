@@ -285,7 +285,10 @@ def prepare_train(request_path: Path) -> int:
         "model": MODEL_PATH, "use_hf": True, "check_model": False,
         "template": "qwen3_5", "template_backend": "swift", "enable_thinking": False,
         "add_non_thinking_prefix": True, "loss_scale": "default", "is_binary_loss_scale": True,
-        "max_length": 8192, "truncation_strategy": "raise", "dataset": [str(dataset)],
+        # ms-swift's public SftArguments spelling is "delete"; it maps to the
+        # template-level "raise" behavior so overlength units are excluded
+        # rather than truncated.
+        "max_length": 8192, "truncation_strategy": "delete", "dataset": [str(dataset)],
         "split_dataset_ratio": 0, "dataset_num_proc": 4, "load_from_cache_file": False,
         "strict": True, "tuner_type": "full", "freeze_llm": False, "freeze_vit": False,
         "freeze_aligner": False, "torch_dtype": "bfloat16", "bf16": True,

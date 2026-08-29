@@ -102,6 +102,29 @@ function isFullySchedulable(output: string): boolean {
     && count('不可调度数量') === 0
 }
 
+function remoteStatus(output: string): Stage4ARJobObservation['status'] {
+  const lines = output.split(/\r?\n/u).map(line => line.trim()).filter(Boolean)
+  const summary = lines
+    .map(line => line.match(/\brjob\s+\S+(?:\s+\(showname=[^)]*\))?\s*:\s*([A-Za-z]+)\s*$/iu)?.[1])
+    .find(value => value !== undefined)
+  const lone = lines.length === 1
+    ? lines[0]?.match(/^(succeeded|completed|success|failed|error|stopped|cancelled|canceled|killed|running|pending|inqueue|starting)$/iu)?.[1]
+    : undefined
+  switch ((summary ?? lone)?.toLowerCase()) {
+    case 'succeeded':
+    case 'completed':
+    case 'success': return 'succeeded'
+    case 'failed':
+    case 'error': return 'failed'
+    case 'stopped':
+    case 'cancelled':
+    case 'canceled':
+    case 'killed': return 'stopped'
+    case 'running': return 'running'
+    default: return 'pending'
+  }
+}
+
 /** Concrete backend for the installed `rjob` CLI. */
 export class Stage4ARJobClient implements Stage4ARJobBackend {
   constructor(private readonly runner: Stage4ACommandRunner) {}
@@ -146,12 +169,7 @@ export class Stage4ARJobClient implements Stage4ARJobBackend {
       throw new Stage4AError(`rjob get failed for ${rjobName}`, 'REMOTE_FAILED')
     }
     if (output.trim() === '') return Object.freeze({ status: 'missing', command: result })
-    let status: Stage4ARJobObservation['status'] = 'pending'
-    if (/\b(succeeded|completed|success)\b/iu.test(output)) status = 'succeeded'
-    else if (/\b(failed|error)\b/iu.test(output)) status = 'failed'
-    else if (/\b(stopped|cancelled|canceled|killed)\b/iu.test(output)) status = 'stopped'
-    else if (/\b(running)\b/iu.test(output)) status = 'running'
-    return Object.freeze({ status, command: result })
+    return Object.freeze({ status: remoteStatus(output), command: result })
   }
 
   async logs(rjobName: string, signal: AbortSignal): Promise<Stage4ACommandResult> {

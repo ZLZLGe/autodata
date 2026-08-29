@@ -11,7 +11,8 @@ H200 作业，不能据此宣称 Gate 4A 已通过。
   模型工具。
 - train 固定使用 4 张 H200、Qwen3.5-9B revision
   `c202236235762e1c871ad0ccb60c8ee5ba337b9a`、全参 bf16、Adafactor、ZeRO-3 和
-  2 个 step。
+  2 个 step。`max_length=8192`，ms-swift 参数使用 `truncation_strategy=delete`；
+  它会把超长 unit 排除并在 template 层映射为禁止截断的 `raise` 行为。
 - eval 固定使用 1 张 H200、vLLM `0.19.1`、`qwen3_coder` parser 和仓库内五个
   BFCL case。
 - 每个阶段严格执行 `rjob submit --dry-run true`、
