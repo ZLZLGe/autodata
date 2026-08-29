@@ -20,7 +20,8 @@ AutoData 是为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harne
 重启恢复；Stage 3B 已用确定性 fake model 和真实 FreeRouter 模型分别驱动
 DSH Agent/Session/Tool loop，并验证直接候选提交，Gate 3 已完成。Python 训练
 和 GPU 评测由 [Stage 4A 兼容性闸门](docs/stage4a-gpu-gate.md) 接管；控制面与
-离线测试已实现，真实 H200 train/eval 尚未执行，因此目前不宣称 Gate 4A 已通过。
+离线测试已实现，正式 H200 train/eval 已于 2026-08-30 通过，Gate 4A 已完成。
+详细实验记录与 artifact 证据保存在项目飞书实验台账。
 
 ## 阶段二（Gate 2 已完成）
 
