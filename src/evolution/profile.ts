@@ -399,7 +399,10 @@ export function normalizeEvaluationReport(input: EvaluationReport): EvaluationRe
     score,
     complete,
   }
-  const runId = optionalString(value, 'run_id', 'INVALID_EVALUATION')
+  const runIdValue = own(value, 'run_id')
+  const runId = runIdValue === undefined
+    ? undefined
+    : requireId(runIdValue, 'run_id', 'INVALID_EVALUATION')
   const baselineIdValue = own(value, 'baseline_candidate_id')
   const baselineCandidateId = baselineIdValue === undefined
     ? undefined

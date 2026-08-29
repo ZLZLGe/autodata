@@ -247,7 +247,12 @@ export class ProcessCandidateValidator implements CandidateValidator {
       return failed(input.candidate_id, withDiagnostic('candidate validation worker returned no result', logs))
     }
     try {
-      return normalizeWorkerResult(JSON.parse(resultOutput.trim()), input.candidate_id)
+      return normalizeCandidateValidationResult(
+        JSON.parse(resultOutput.trim()),
+        input.candidate_id,
+        input.plugin_id,
+        input.plugin_version,
+      )
     } catch {
       return failed(input.candidate_id, 'candidate validation worker returned a malformed result')
     }
@@ -264,35 +269,51 @@ function workerEnvironment(environment: NodeJS.ProcessEnv = process.env): NodeJS
   return worker
 }
 
-function normalizeWorkerResult(value: unknown, candidateId: string): CandidateValidationResult {
+/** Revalidate even injected Validator results against the exact candidate contract. */
+export function normalizeCandidateValidationResult(
+  value: unknown,
+  candidateId: string,
+  pluginId: string,
+  pluginVersion: string,
+): CandidateValidationResult {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error('result must be an object')
+  const prototype = Object.getPrototypeOf(value) as unknown
+  if (prototype !== Object.prototype && prototype !== null) throw new Error('result must be a plain object')
   const result = value as Record<string, unknown>
   if (
     result.schema_version !== CANDIDATE_VALIDATION_SCHEMA_VERSION
     || result.candidate_id !== candidateId
     || typeof result.ok !== 'boolean'
   ) throw new Error('invalid validation result')
-  if (result.plugin_id !== undefined && (typeof result.plugin_id !== 'string' || result.plugin_id.length === 0)) {
-    throw new Error('invalid validation plugin_id')
+  const allowed = result.ok
+    ? new Set(['schema_version', 'candidate_id', 'ok', 'plugin_id', 'plugin_version'])
+    : new Set(['schema_version', 'candidate_id', 'ok', 'reason'])
+  const fields = Reflect.ownKeys(result)
+  const extra = fields.find(key => typeof key !== 'string' || !allowed.has(key))
+  if (extra !== undefined) throw new Error(`validation result has unsupported field ${String(extra)}`)
+  if (fields.length !== allowed.size || [...allowed].some(key => !Object.hasOwn(result, key))) {
+    throw new Error('validation result does not have the exact schema')
   }
-  if (result.plugin_version !== undefined && (typeof result.plugin_version !== 'string' || result.plugin_version.length === 0)) {
-    throw new Error('invalid validation plugin_version')
+  if (result.ok) {
+    if (result.plugin_id !== pluginId || result.plugin_version !== pluginVersion) {
+      throw new Error('successful validation result has the wrong plugin identity')
+    }
+    return Object.freeze({
+      schema_version: CANDIDATE_VALIDATION_SCHEMA_VERSION,
+      candidate_id: candidateId,
+      ok: true,
+      plugin_id: pluginId,
+      plugin_version: pluginVersion,
+    })
   }
-  if (result.reason !== undefined && (typeof result.reason !== 'string' || result.reason.trim().length === 0)) {
-    throw new Error('invalid validation reason')
+  if (typeof result.reason !== 'string' || result.reason.trim().length === 0) {
+    throw new Error('failed validation result has no reason')
   }
-  if (result.ok && (result.plugin_id === undefined || result.plugin_version === undefined)) {
-    throw new Error('successful validation result has no plugin identity')
-  }
-  if (!result.ok && result.reason === undefined) throw new Error('failed validation result has no reason')
-
   return Object.freeze({
     schema_version: CANDIDATE_VALIDATION_SCHEMA_VERSION,
     candidate_id: candidateId,
-    ok: result.ok,
-    ...(result.plugin_id === undefined ? {} : { plugin_id: result.plugin_id }),
-    ...(result.plugin_version === undefined ? {} : { plugin_version: result.plugin_version }),
-    ...(result.reason === undefined ? {} : { reason: trimDiagnostic(result.reason as string) }),
+    ok: false,
+    reason: trimDiagnostic(result.reason),
   })
 }
 

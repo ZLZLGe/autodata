@@ -362,7 +362,7 @@ describe('Stage 3 persistence consistency', () => {
       .toThrow(/already used/)
   })
 
-  it('rejects duplicate report ids and incoherent accepted decisions in both Stores', () => {
+  it('idempotently replays identical evaluations and rejects conflicting records in both Stores', () => {
     const profile = taskProfile()
     const memory = new MemoryEvolutionStore()
     const initial = memory.createProfile(profile)
@@ -372,6 +372,7 @@ describe('Stage 3 persistence consistency', () => {
     const report = evaluationReport(profile, validated, persisted.manifest.candidate_id, { run_id: 'run-one' })
     const decision = decideEvaluation(profile, validated, report)
     memory.saveEvaluation(profile.id, { report, decision })
+    expect(() => memory.saveEvaluation(profile.id, { report, decision })).not.toThrow()
     expect(() => memory.saveEvaluation(profile.id, {
       report: { ...report, run_id: 'run-two' },
       decision,
@@ -393,10 +394,37 @@ describe('Stage 3 persistence consistency', () => {
     const files = new FileEvolutionStore(directory)
     files.createProfile(profile)
     files.saveEvaluation(profile.id, { report, decision })
+    expect(() => files.saveEvaluation(profile.id, { report, decision })).not.toThrow()
     expect(() => files.saveEvaluation(profile.id, {
       report: { ...report, run_id: 'run-two' },
       decision,
     })).toThrow(/already exists/)
+  })
+
+  it('applies the same strict run_id rule and run uniqueness in both Stores', () => {
+    const profile = taskProfile()
+    const stores: EvolutionStore[] = [new MemoryEvolutionStore()]
+    const directory = mkdtempSync(join(tmpdir(), 'autodata-evolution-'))
+    temporaryDirectories.push(directory)
+    stores.push(new FileEvolutionStore(directory))
+
+    for (const store of stores) {
+      const initial = store.createProfile(profile)
+      const persisted = persistCandidate(store, profile, initial)
+      const validated = validateCandidate(persisted.state, persisted.manifest.candidate_id)
+      store.saveState(validated)
+      const first = evaluationReport(profile, validated, persisted.manifest.candidate_id, { run_id: 'run-one' })
+      const decision = decideEvaluation(profile, validated, first)
+      expect(() => store.saveEvaluation(profile.id, {
+        report: { ...first, report_id: 'invalid-run-report', run_id: '../escape' },
+        decision,
+      })).toThrow(/run_id.*match/iu)
+      store.saveEvaluation(profile.id, { report: first, decision })
+      expect(() => store.saveEvaluation(profile.id, {
+        report: { ...first, report_id: 'second-report' },
+        decision,
+      })).toThrow(/run.*already exists/iu)
+    }
   })
 
   it('uses state.json as the only pointer and ignores file orphans without reusing ids', () => {

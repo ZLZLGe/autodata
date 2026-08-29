@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import AutoDataService from '../src/service.js'
 import {
   CANDIDATE_MANIFEST_SCHEMA_VERSION,
+  CandidateActivationError,
   DshEvolutionRuntime,
   MemoryEvolutionStore,
   ProcessCandidateValidator,
@@ -117,7 +118,7 @@ describe('DshEvolutionRuntime', () => {
       }
     `)
 
-    await expect(runtime.activate(profile, first, broken, agent)).rejects.toMatchObject({ code: 'RUNTIME_FAILED' })
+    await expect(runtime.activate(profile, first, broken, agent)).rejects.toBeInstanceOf(CandidateActivationError)
     expect(ctx.autodata.plugins()).toContainEqual({ id: 'bfcl-strategy', version: '1' })
     expect(ctx.autodata.plugins()).not.toContainEqual({ id: 'bfcl-strategy', version: '2' })
     const row = ctx.dynamicCordisRunner.inventory()[0]
@@ -279,6 +280,17 @@ describe('DshEvolutionRuntime', () => {
 
     expect(ctx.dynamicCordisRunner.inventory()).toHaveLength(1)
     expect(ctx.autodata.plugins()).toContainEqual({ id: 'bfcl-strategy', version: '1' })
+  })
+
+  it('classifies failure to establish the durable active candidate as degraded', async () => {
+    const { ctx, profile, runtime } = await setup()
+    const broken = candidate('1', `
+      return { inject: ['autodata'], apply() { throw new Error('durable active failed') } }
+    `)
+
+    await expect(runtime.ensureActive(profile, broken, agent)).rejects.toMatchObject({ code: 'RUNTIME_DEGRADED' })
+    expect(ctx.autodata.plugins()).toEqual([{ id: 'toolcall-h0', version: '3' }])
+    expect(ctx.dynamicCordisRunner.inventory()).toHaveLength(0)
   })
 
   it('reports a missing Runner dependency as unavailable without touching H0', async () => {

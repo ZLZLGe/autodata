@@ -570,7 +570,9 @@ export class MemoryEvolutionStore implements EvolutionStore {
     if (record.report.profile_id !== profileId) {
       throw new EvolutionError('evaluation profile_id does not match Store profile', 'INVALID_EVALUATION')
     }
-    if (this.getEvaluation(profileId, record.report.report_id) !== undefined) {
+    const existing = this.getEvaluation(profileId, record.report.report_id)
+    if (existing !== undefined && sameJson(existing, record)) return
+    if (existing !== undefined) {
       throw new EvolutionError(`evaluation ${record.report.report_id} already exists`, 'INVALID_EVALUATION', {
         profile_id: profileId,
         candidate_id: record.report.candidate_id,
@@ -585,6 +587,7 @@ export class MemoryEvolutionStore implements EvolutionStore {
       throw new EvolutionError(`evaluation ${record.report.report_id} already exists`, 'INVALID_EVALUATION')
     }
     const runId = record.report.run_id ?? record.report.report_id
+    validateId(runId, 'evaluation run_id')
     if ([...entries.values()].some(value => (value.report.run_id ?? value.report.report_id) === runId)) {
       throw new EvolutionError(`evaluation run ${runId} already exists`, 'INVALID_EVALUATION', {
         profile_id: profileId,
@@ -911,7 +914,9 @@ export class FileEvolutionStore implements EvolutionStore {
     if (record.report.profile_id !== profileId) {
       throw new EvolutionError('evaluation profile_id does not match Store profile', 'INVALID_EVALUATION')
     }
-    if (this.getEvaluation(profileId, record.report.report_id) !== undefined) {
+    const existing = this.getEvaluation(profileId, record.report.report_id)
+    if (existing !== undefined && sameJson(existing, record)) return
+    if (existing !== undefined) {
       throw new EvolutionError(`evaluation ${record.report.report_id} already exists`, 'INVALID_EVALUATION', {
         profile_id: profileId,
         candidate_id: record.report.candidate_id,

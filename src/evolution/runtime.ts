@@ -19,6 +19,17 @@ export interface RuntimeActivation {
   rollback(): Promise<void>
 }
 
+/** A candidate-local failure reported only after the previous active runtime is restored. */
+export class CandidateActivationError extends EvolutionError {
+  constructor(
+    message: string,
+    options: { readonly profile_id?: string; readonly candidate_id?: string; readonly cause?: unknown } = {},
+  ) {
+    super(message, 'RUNTIME_FAILED', options)
+    this.name = 'CandidateActivationError'
+  }
+}
+
 export interface EvolutionRuntime {
   ensureActive(profile: TaskProfile, candidate: CandidatePackage | null, agent: EvolutionRuntimeAgent): Promise<void>
   activate(
@@ -68,6 +79,31 @@ export class DshEvolutionRuntime implements EvolutionRuntime {
     agent: EvolutionRuntimeAgent,
   ): Promise<void> {
     this.assertUsable()
+    try {
+      await this.ensureActiveInternal(profile, candidate, agent)
+    } catch (error) {
+      if (
+        candidate !== null
+        && (
+          error instanceof CandidateActivationError
+          || (error instanceof EvolutionError && (error.code === 'RUNTIME_FAILED' || error.code === 'RUNTIME_STATE'))
+        )
+      ) {
+        throw new EvolutionError('failed to establish the durable active candidate', 'RUNTIME_DEGRADED', {
+          profile_id: profile.id,
+          candidate_id: candidate.manifest.candidate_id,
+          cause: error,
+        })
+      }
+      throw error
+    }
+  }
+
+  private async ensureActiveInternal(
+    profile: TaskProfile,
+    candidate: CandidatePackage | null,
+    agent: EvolutionRuntimeAgent,
+  ): Promise<void> {
     if (candidate === null) {
       await this.ensureH0(profile)
       return
@@ -255,17 +291,17 @@ export class DshEvolutionRuntime implements EvolutionRuntime {
       await this.runPackage(profile, candidate, slot, receipt.packageId, 'run', before, null)
       return slot
     } catch (error) {
-      if (slot !== undefined) {
-        try {
+      try {
+        if (slot !== undefined) {
           await this.cleanupSlot(slot)
-          this.assertSurface(before)
-        } catch (cleanupError) {
-          throw new EvolutionError('candidate activation failed and its runtime could not be cleaned up', 'RUNTIME_DEGRADED', {
-            profile_id: profile.id,
-            candidate_id: candidate.manifest.candidate_id,
-            cause: new AggregateError([error, cleanupError]),
-          })
         }
+        this.assertSurface(before)
+      } catch (cleanupError) {
+        throw new EvolutionError('candidate activation failed and its runtime could not be cleaned up', 'RUNTIME_DEGRADED', {
+          profile_id: profile.id,
+          candidate_id: candidate.manifest.candidate_id,
+          cause: new AggregateError([error, cleanupError]),
+        })
       }
       throw this.activationError(profile, candidate, runner, error)
     }
@@ -635,7 +671,15 @@ export class DshEvolutionRuntime implements EvolutionRuntime {
     runner: DynamicCordisRunnerService,
     error: unknown,
   ): EvolutionError {
-    if (error instanceof EvolutionError) return error
+    if (error instanceof CandidateActivationError) return error
+    if (error instanceof EvolutionError) {
+      if (error.code !== 'RUNTIME_FAILED') return error
+      return new CandidateActivationError(error.message, {
+        profile_id: profile.id,
+        candidate_id: candidate.manifest.candidate_id,
+        cause: error,
+      })
+    }
     if (this.currentRunner() !== runner) {
       return new EvolutionError('DSH dynamicCordisRunner changed during candidate activation', 'RUNTIME_UNAVAILABLE', {
         profile_id: profile.id,
@@ -643,7 +687,7 @@ export class DshEvolutionRuntime implements EvolutionRuntime {
         cause: error,
       })
     }
-    return new EvolutionError('candidate activation failed', 'RUNTIME_FAILED', {
+    return new CandidateActivationError('candidate activation failed', {
       profile_id: profile.id,
       candidate_id: candidate.manifest.candidate_id,
       cause: error,

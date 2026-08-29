@@ -7,6 +7,7 @@ import {
   type CandidatePackage,
   type CandidateState,
   type EvaluationReport,
+  type EvaluationRecord,
   type EvolutionFeedback,
   type EvolutionState,
   type EvolutionStore,
@@ -17,6 +18,7 @@ import {
 import { canonicalJson } from '../core/json.js'
 import {
   normalizeEvolutionFeedback,
+  normalizeEvaluationReport,
   normalizeTaskProfile,
 } from './profile.js'
 import {
@@ -28,8 +30,17 @@ import {
   rollbackCandidate,
   validateCandidate as transitionValidated,
 } from './state.js'
-import type { CandidateValidationResult, CandidateValidator } from './validator.js'
-import type { EvolutionRuntime, EvolutionRuntimeAgent, RuntimeActivation } from './runtime.js'
+import {
+  normalizeCandidateValidationResult,
+  type CandidateValidationResult,
+  type CandidateValidator,
+} from './validator.js'
+import {
+  CandidateActivationError,
+  type EvolutionRuntime,
+  type EvolutionRuntimeAgent,
+  type RuntimeActivation,
+} from './runtime.js'
 
 export interface CandidateSubmissionInput {
   readonly candidate_id: string
@@ -67,6 +78,7 @@ export class EvolutionController {
   readonly store: EvolutionStore
   private readonly validator: CandidateValidator
   private readonly runtime: EvolutionRuntime | undefined
+  private readonly profileMutations = new Map<string, Promise<void>>()
   private disposed = false
   private disposal: Promise<void> | undefined
 
@@ -211,36 +223,48 @@ export class EvolutionController {
   }
 
   async validateCandidate(profileId: string, candidateId: string): Promise<CandidateValidationOutcome> {
-    this.assertUsable()
-    const snapshot = this.store.loadConsistentSnapshot(profileId)
-    const stateCandidate = this.requireStateCandidate(snapshot.state, candidateId)
-    if (snapshot.state.open_candidate_id !== candidateId || stateCandidate.status !== 'proposed') {
-      throw new EvolutionError(`candidate ${candidateId} is not proposed`, 'CANDIDATE_STATE', {
-        profile_id: profileId,
-        candidate_id: candidateId,
-      })
-    }
-    const candidate = this.requireCandidate(snapshot.candidate_packages, profileId, candidateId)
-    let validation: CandidateValidationResult
-    try {
-      validation = await this.validator.validate(snapshot.profile, candidate)
-    } catch (error) {
-      // An unavailable worker is infrastructure failure: keep proposed/open so
-      // the same candidate can be retried after the host is repaired.
-      if (error instanceof EvolutionError && error.code === 'VALIDATION_UNAVAILABLE') throw error
-      throw error
-    }
-    if (validation.candidate_id !== candidateId && validation.candidate_id !== 'unknown') {
-      throw new EvolutionError('validator returned a different candidate_id', 'RUNTIME_FAILED', {
-        profile_id: profileId,
-        candidate_id: candidateId,
-      })
-    }
-    const next = validation.ok
-      ? transitionValidated(snapshot.state, candidateId)
-      : rejectCandidate(snapshot.state, candidateId)
-    this.store.saveState(next)
-    return Object.freeze({ validation, status: this.status(profileId) })
+    return this.withProfileMutation(profileId, async () => {
+      const snapshot = this.store.loadConsistentSnapshot(profileId)
+      const stateCandidate = this.requireStateCandidate(snapshot.state, candidateId)
+      if (snapshot.state.open_candidate_id !== candidateId || stateCandidate.status !== 'proposed') {
+        throw new EvolutionError(`candidate ${candidateId} is not proposed`, 'CANDIDATE_STATE', {
+          profile_id: profileId,
+          candidate_id: candidateId,
+        })
+      }
+      const candidate = this.requireCandidate(snapshot.candidate_packages, profileId, candidateId)
+      const rawValidation = await this.validator.validate(snapshot.profile, candidate)
+      let validation: CandidateValidationResult
+      try {
+        validation = normalizeCandidateValidationResult(
+          rawValidation,
+          candidateId,
+          snapshot.profile.strategy_plugin_id,
+          candidate.manifest.strategy_version,
+        )
+      } catch (error) {
+        throw new EvolutionError('validator returned a malformed or mismatched result', 'VALIDATION_UNAVAILABLE', {
+          profile_id: profileId,
+          candidate_id: candidateId,
+          cause: error,
+        })
+      }
+
+      // Synchronous Host feedback may have committed while validation ran.
+      const refreshed = this.store.loadConsistentSnapshot(profileId)
+      const refreshedCandidate = this.requireStateCandidate(refreshed.state, candidateId)
+      if (refreshed.state.open_candidate_id !== candidateId || refreshedCandidate.status !== 'proposed') {
+        throw new EvolutionError(`candidate ${candidateId} changed while validation was running`, 'CANDIDATE_STATE', {
+          profile_id: profileId,
+          candidate_id: candidateId,
+        })
+      }
+      const next = validation.ok
+        ? transitionValidated(refreshed.state, candidateId)
+        : rejectCandidate(refreshed.state, candidateId)
+      this.store.saveState(next)
+      return Object.freeze({ validation, status: this.status(profileId) })
+    })
   }
 
   /** Append Host-authored B_search feedback for the currently active version. */
@@ -272,56 +296,110 @@ export class EvolutionController {
   }
 
   async recordEvaluation(
-    report: EvaluationReport,
+    reportInput: EvaluationReport,
     agent?: EvolutionRuntimeAgent,
   ): Promise<EvaluationOutcome> {
-    this.assertUsable()
-    const snapshot = this.store.loadConsistentSnapshot(report.profile_id)
-    const transition = transitionEvaluation(snapshot.profile, snapshot.state, report)
-    let activation: RuntimeActivation | undefined
-
-    if (transition.decision.accepted) {
-      if (agent === undefined) {
-        throw new EvolutionError('accepting a candidate requires a live DSH Agent', 'RUNTIME_UNAVAILABLE', {
-          profile_id: report.profile_id,
-          candidate_id: report.candidate_id,
-        })
+    const report = normalizeEvaluationReport(reportInput)
+    return this.withProfileMutation(report.profile_id, async () => {
+      let snapshot = this.store.loadConsistentSnapshot(report.profile_id)
+      const existing = this.store.getEvaluation(report.profile_id, report.report_id)
+      const committed = this.committedEvaluationDecision(snapshot.state, report, existing)
+      if (committed !== undefined) {
+        return Object.freeze({ decision: committed, status: this.status(report.profile_id) })
       }
-      const current = this.activePackage(snapshot.state, snapshot.candidate_packages)
-      const candidate = this.requireCandidate(snapshot.candidate_packages, report.profile_id, report.candidate_id)
-      try {
-        activation = await this.requireRuntime().activate(snapshot.profile, current, candidate, agent)
-      } catch (error) {
-        // RUNTIME_FAILED means the candidate itself failed after the old active
-        // was restored. Turn that into a durable rejection. Unavailable or
-        // degraded infrastructure remains open for a later retry.
-        if (error instanceof EvolutionError && error.code === 'RUNTIME_FAILED') {
+      this.assertMatchingEvaluationRecord(report, existing)
+
+      let transition = transitionEvaluation(snapshot.profile, snapshot.state, report)
+      if (existing?.decision?.reason === 'runtime_activation_failed') {
+        const rejected = rejectRuntimeActivation(snapshot.state, report, transition.decision)
+        this.assertSameDecision(existing.decision, rejected.decision, report)
+        try {
+          this.persistEvaluationTransition(rejected.state, report, rejected.decision)
+        } catch (error) {
+          this.restoreState(snapshot.state)
+          throw error
+        }
+        return Object.freeze({ decision: rejected.decision, status: this.status(report.profile_id) })
+      }
+      if (existing?.decision !== undefined) {
+        this.assertSameDecision(existing.decision, transition.decision, report)
+      }
+
+      let activation: RuntimeActivation | undefined
+      if (transition.decision.accepted) {
+        if (agent === undefined) {
+          throw new EvolutionError('accepting a candidate requires a live DSH Agent', 'RUNTIME_UNAVAILABLE', {
+            profile_id: report.profile_id,
+            candidate_id: report.candidate_id,
+          })
+        }
+        const current = this.activePackage(snapshot.state, snapshot.candidate_packages)
+        const candidate = this.requireCandidate(snapshot.candidate_packages, report.profile_id, report.candidate_id)
+        try {
+          activation = await this.requireRuntime().activate(snapshot.profile, current, candidate, agent)
+        } catch (error) {
+          if (!(error instanceof CandidateActivationError)) throw error
+          if (existing !== undefined) {
+            throw new EvolutionError('a previously activated candidate could not be reactivated', 'RUNTIME_DEGRADED', {
+              profile_id: report.profile_id,
+              candidate_id: report.candidate_id,
+              cause: error,
+            })
+          }
+          // CandidateActivationError guarantees that the previous active
+          // runtime has already been restored. Re-read state to retain any
+          // synchronous feedback committed while activation was attempted.
+          snapshot = this.store.loadConsistentSnapshot(report.profile_id)
+          transition = transitionEvaluation(snapshot.profile, snapshot.state, report)
           const rejected = rejectRuntimeActivation(snapshot.state, report, transition.decision)
-          this.persistEvaluationTransition(snapshot, rejected.state, report, rejected.decision)
+          try {
+            this.persistEvaluationTransition(rejected.state, report, rejected.decision)
+          } catch (persistError) {
+            this.restoreState(snapshot.state)
+            throw persistError
+          }
           return Object.freeze({ decision: rejected.decision, status: this.status(report.profile_id) })
+        }
+
+        try {
+          const refreshed = this.store.loadConsistentSnapshot(report.profile_id)
+          const refreshedTransition = transitionEvaluation(refreshed.profile, refreshed.state, report)
+          this.assertSameDecision(transition.decision, refreshedTransition.decision, report)
+          snapshot = refreshed
+          transition = refreshedTransition
+        } catch (error) {
+          try {
+            await activation.rollback()
+          } catch (rollbackError) {
+            throw new EvolutionError('state changed and the activated candidate could not be rolled back', 'RUNTIME_DEGRADED', {
+              profile_id: report.profile_id,
+              candidate_id: report.candidate_id,
+              cause: new AggregateError([error, rollbackError]),
+            })
+          }
+          throw error
+        }
+      }
+
+      try {
+        this.persistEvaluationTransition(transition.state, report, transition.decision)
+      } catch (error) {
+        this.restoreState(snapshot.state)
+        if (activation !== undefined) {
+          try {
+            await activation.rollback()
+          } catch (rollbackError) {
+            throw new EvolutionError('failed to restore runtime after persistence failure', 'RUNTIME_DEGRADED', {
+              profile_id: report.profile_id,
+              candidate_id: report.candidate_id,
+              cause: new AggregateError([error, rollbackError]),
+            })
+          }
         }
         throw error
       }
-    }
-
-    try {
-      this.persistEvaluationTransition(snapshot, transition.state, report, transition.decision)
-    } catch (error) {
-      this.restoreState(snapshot.state)
-      if (activation !== undefined) {
-        try {
-          await activation.rollback()
-        } catch (rollbackError) {
-          throw new EvolutionError('failed to restore runtime after persistence failure', 'RUNTIME_DEGRADED', {
-            profile_id: report.profile_id,
-            candidate_id: report.candidate_id,
-            cause: rollbackError,
-          })
-        }
-      }
-      throw error
-    }
-    return Object.freeze({ decision: transition.decision, status: this.status(report.profile_id) })
+      return Object.freeze({ decision: transition.decision, status: this.status(report.profile_id) })
+    })
   }
 
   async rollback(
@@ -329,38 +407,72 @@ export class EvolutionController {
     targetCandidateId: string,
     agent: EvolutionRuntimeAgent,
   ): Promise<EvolutionStatus> {
-    this.assertUsable()
-    const snapshot = this.store.loadConsistentSnapshot(profileId)
-    const next = rollbackCandidate(snapshot.state, targetCandidateId)
-    if (next === snapshot.state) return this.status(profileId)
-    const current = this.activePackage(snapshot.state, snapshot.candidate_packages)
-    const target = targetCandidateId === H0_CANDIDATE_ID
-      ? null
-      : this.requireCandidate(snapshot.candidate_packages, profileId, targetCandidateId)
-    const runtime = this.requireRuntime()
-    let activation: RuntimeActivation | undefined
-    if (target === null) {
-      await runtime.ensureActive(snapshot.profile, null, agent)
-    } else {
-      activation = await runtime.activate(snapshot.profile, current, target, agent)
-    }
-    try {
-      this.store.saveState(next)
-    } catch (error) {
-      this.restoreState(snapshot.state)
-      if (activation !== undefined) await activation.rollback()
-      else if (current !== null) await runtime.ensureActive(snapshot.profile, current, agent)
-      throw error
-    }
-    return this.status(profileId)
+    return this.withProfileMutation(profileId, async () => {
+      const snapshot = this.store.loadConsistentSnapshot(profileId)
+      let next = rollbackCandidate(snapshot.state, targetCandidateId)
+      if (next === snapshot.state) return this.status(profileId)
+      const current = this.activePackage(snapshot.state, snapshot.candidate_packages)
+      const target = targetCandidateId === H0_CANDIDATE_ID
+        ? null
+        : this.requireCandidate(snapshot.candidate_packages, profileId, targetCandidateId)
+      const runtime = this.requireRuntime()
+      let activation: RuntimeActivation | undefined
+      if (target === null) {
+        await runtime.ensureActive(snapshot.profile, null, agent)
+      } else {
+        try {
+          activation = await runtime.activate(snapshot.profile, current, target, agent)
+        } catch (error) {
+          if (!(error instanceof CandidateActivationError)) throw error
+          throw new EvolutionError('failed to activate an accepted rollback target', 'RUNTIME_DEGRADED', {
+            profile_id: profileId,
+            candidate_id: targetCandidateId,
+            cause: error,
+          })
+        }
+      }
+
+      let refreshed
+      try {
+        refreshed = this.store.loadConsistentSnapshot(profileId)
+        if (refreshed.state.active_candidate_id !== snapshot.state.active_candidate_id) {
+          throw new EvolutionError('active candidate changed while rollback was running', 'RUNTIME_STATE', {
+            profile_id: profileId,
+            candidate_id: targetCandidateId,
+          })
+        }
+        next = rollbackCandidate(refreshed.state, targetCandidateId)
+      } catch (error) {
+        return this.restoreRuntimeAndRethrow(
+          runtime, snapshot.profile, current, activation, agent, targetCandidateId, error,
+        )
+      }
+
+      try {
+        this.store.saveState(next)
+      } catch (error) {
+        this.restoreState(refreshed.state)
+        return this.restoreRuntimeAndRethrow(
+          runtime, snapshot.profile, current, activation, agent, targetCandidateId, error,
+        )
+      }
+      return this.status(profileId)
+    })
   }
 
   async resume(profileId: string, agent: EvolutionRuntimeAgent): Promise<EvolutionStatus> {
-    this.assertUsable()
-    const snapshot = this.store.loadConsistentSnapshot(profileId)
-    const active = this.activePackage(snapshot.state, snapshot.candidate_packages)
-    await this.requireRuntime().ensureActive(snapshot.profile, active, agent)
-    return this.status(profileId)
+    return this.withProfileMutation(profileId, async () => {
+      const snapshot = this.store.loadConsistentSnapshot(profileId)
+      const active = this.activePackage(snapshot.state, snapshot.candidate_packages)
+      await this.requireRuntime().ensureActive(snapshot.profile, active, agent)
+      const refreshed = this.store.loadConsistentSnapshot(profileId)
+      if (refreshed.state.active_candidate_id !== snapshot.state.active_candidate_id) {
+        throw new EvolutionError('active candidate changed while runtime resume was running', 'RUNTIME_STATE', {
+          profile_id: profileId,
+        })
+      }
+      return this.status(profileId)
+    })
   }
 
   status(profileId: string): EvolutionStatus {
@@ -381,17 +493,113 @@ export class EvolutionController {
   }
 
   private persistEvaluationTransition(
-    snapshot: { readonly state: EvolutionState },
     state: EvolutionState,
     report: EvaluationReport,
     decision: AcceptanceDecision,
   ): void {
+    // The immutable record is the prepare step. state.json is the sole commit
+    // pointer, so a crash in between is safe to replay.
+    this.store.saveEvaluation(report.profile_id, { report, decision })
     this.store.saveState(state)
+  }
+
+  private committedEvaluationDecision(
+    state: EvolutionState,
+    report: EvaluationReport,
+    record: EvaluationRecord | undefined,
+  ): AcceptanceDecision | undefined {
+    const committed = state.candidates.filter(candidate => candidate.evaluation?.report_id === report.report_id)
+    if (committed.length === 0) return undefined
+    if (committed.length !== 1 || record?.decision === undefined) {
+      throw new EvolutionError(`committed evaluation ${report.report_id} has no unique durable record`, 'STATE_CORRUPT', {
+        profile_id: report.profile_id,
+        candidate_id: report.candidate_id,
+      })
+    }
+    this.assertMatchingEvaluationRecord(report, record)
+    const candidate = committed[0]!
+    if (
+      candidate.candidate_id !== report.candidate_id
+      || (record.decision.accepted
+        ? candidate.status !== 'accepted' && candidate.status !== 'retired'
+        : candidate.status !== 'rejected')
+    ) {
+      throw new EvolutionError(`committed evaluation ${report.report_id} contradicts state`, 'STATE_CORRUPT', {
+        profile_id: report.profile_id,
+        candidate_id: report.candidate_id,
+      })
+    }
+    return record.decision
+  }
+
+  private assertMatchingEvaluationRecord(
+    report: EvaluationReport,
+    record: EvaluationRecord | undefined,
+  ): void {
+    if (record === undefined) return
+    if (canonicalJson(record.report) !== canonicalJson(report)) {
+      throw new EvolutionError(`evaluation ${report.report_id} conflicts with its durable record`, 'INVALID_EVALUATION', {
+        profile_id: report.profile_id,
+        candidate_id: report.candidate_id,
+      })
+    }
+    if (record.decision === undefined) {
+      throw new EvolutionError(`evaluation ${report.report_id} has no durable decision`, 'STATE_CORRUPT', {
+        profile_id: report.profile_id,
+        candidate_id: report.candidate_id,
+      })
+    }
+  }
+
+  private assertSameDecision(
+    expected: AcceptanceDecision,
+    actual: AcceptanceDecision,
+    report: EvaluationReport,
+  ): void {
+    if (canonicalJson(expected) !== canonicalJson(actual)) {
+      throw new EvolutionError(`evaluation ${report.report_id} no longer has its durable decision`, 'STATE_CORRUPT', {
+        profile_id: report.profile_id,
+        candidate_id: report.candidate_id,
+      })
+    }
+  }
+
+  private async restoreRuntimeAndRethrow(
+    runtime: EvolutionRuntime,
+    profile: TaskProfile,
+    current: CandidatePackage | null,
+    activation: RuntimeActivation | undefined,
+    agent: EvolutionRuntimeAgent,
+    targetCandidateId: string,
+    primaryError: unknown,
+  ): Promise<never> {
     try {
-      this.store.saveEvaluation(report.profile_id, { report, decision })
-    } catch (error) {
-      this.restoreState(snapshot.state)
-      throw error
+      if (activation !== undefined) await activation.rollback()
+      else if (current !== null) await runtime.ensureActive(profile, current, agent)
+    } catch (restoreError) {
+      throw new EvolutionError('failed to restore runtime after rollback was not committed', 'RUNTIME_DEGRADED', {
+        profile_id: profile.id,
+        candidate_id: targetCandidateId,
+        cause: new AggregateError([primaryError, restoreError]),
+      })
+    }
+    throw primaryError
+  }
+
+  private async withProfileMutation<T>(profileId: string, operation: () => Promise<T>): Promise<T> {
+    this.assertUsable()
+    const previous = this.profileMutations.get(profileId) ?? Promise.resolve()
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const tail = previous.then(() => gate)
+    this.profileMutations.set(profileId, tail)
+    await previous
+    try {
+      this.assertUsable()
+      return await operation()
+    } finally {
+      release()
+      if (this.profileMutations.get(profileId) === tail) this.profileMutations.delete(profileId)
     }
   }
 

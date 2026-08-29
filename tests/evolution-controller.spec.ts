@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   EVALUATION_REPORT_SCHEMA_VERSION,
   EVOLUTION_FEEDBACK_SCHEMA_VERSION,
+  CandidateActivationError,
   EvolutionController,
   EvolutionError,
   MemoryEvolutionStore,
@@ -19,11 +20,13 @@ const hostSource = 'return { inject: ["autodata"], apply() {} }'
 
 class FixedValidator implements CandidateValidator {
   unavailable = false
+  hook: (() => Promise<void>) | undefined
 
   constructor(private readonly ok: boolean) {}
 
   async validate(profile: TaskProfile, candidate: CandidatePackage): Promise<CandidateValidationResult> {
     if (this.unavailable) throw new EvolutionError('validator unavailable', 'VALIDATION_UNAVAILABLE')
+    await this.hook?.()
     return {
       schema_version: 'autodata-candidate-validation-1',
       candidate_id: candidate.manifest.candidate_id,
@@ -40,11 +43,14 @@ class FakeRuntime implements EvolutionRuntime {
   readonly ensured: Array<string | null> = []
   readonly activated: string[] = []
   readonly rolledBack: string[] = []
-  failActivation: 'candidate' | 'unavailable' | 'degraded' | null = null
+  failActivation: 'candidate' | 'ambiguous' | 'unavailable' | 'degraded' | null = null
+  activateHook: (() => Promise<void>) | undefined
+  ensureHook: (() => Promise<void>) | undefined
   disposed = false
 
   async ensureActive(_profile: TaskProfile, candidate: CandidatePackage | null): Promise<void> {
     this.ensured.push(candidate?.manifest.candidate_id ?? null)
+    await this.ensureHook?.()
   }
 
   async activate(
@@ -52,13 +58,14 @@ class FakeRuntime implements EvolutionRuntime {
     _current: CandidatePackage | null,
     candidate: CandidatePackage,
   ): Promise<RuntimeActivation> {
+    await this.activateHook?.()
     if (this.failActivation !== null) {
-      const code = this.failActivation === 'candidate'
-        ? 'RUNTIME_FAILED'
-        : this.failActivation === 'unavailable'
-          ? 'RUNTIME_UNAVAILABLE'
-          : 'RUNTIME_DEGRADED'
-      throw new EvolutionError('activation failed', code)
+      if (this.failActivation === 'candidate') throw new CandidateActivationError('activation failed')
+      if (this.failActivation === 'ambiguous') throw new EvolutionError('activation failed', 'RUNTIME_FAILED')
+      throw new EvolutionError(
+        'activation failed',
+        this.failActivation === 'unavailable' ? 'RUNTIME_UNAVAILABLE' : 'RUNTIME_DEGRADED',
+      )
     }
     this.activated.push(candidate.manifest.candidate_id)
     return {
@@ -71,11 +78,34 @@ class FakeRuntime implements EvolutionRuntime {
   }
 }
 
-function createController(ok = true) {
-  const runtime = new FakeRuntime()
-  const validator = new FixedValidator(ok)
+class FailEvaluationCommitStore extends MemoryEvolutionStore {
+  failNextEvaluationCommit = false
+
+  override saveState(state: Parameters<MemoryEvolutionStore['saveState']>[0]): void {
+    if (
+      this.failNextEvaluationCommit
+      && state.candidates.some(candidate => candidate.evaluation !== undefined)
+    ) {
+      this.failNextEvaluationCommit = false
+      throw new EvolutionError('simulated state commit failure', 'STORE_IO')
+    }
+    super.saveState(state)
+  }
+}
+
+function deferred() {
+  let resolve!: () => void
+  const promise = new Promise<void>((done) => { resolve = done })
+  return { promise, resolve }
+}
+
+function setupController<T extends CandidateValidator>(
+  validator: T,
+  store = new MemoryEvolutionStore(),
+  runtime = new FakeRuntime(),
+) {
   const controller = new EvolutionController({
-    store: new MemoryEvolutionStore(),
+    store,
     validator,
     runtime,
   })
@@ -86,6 +116,10 @@ function createController(ok = true) {
     acceptance: { metric: 'accuracy' },
   })
   return { controller, runtime, validator }
+}
+
+function createController(ok = true, store = new MemoryEvolutionStore()) {
+  return setupController(new FixedValidator(ok), store)
 }
 
 function submit(controller: EvolutionController, candidateId: string, version: string) {
@@ -199,6 +233,70 @@ describe('EvolutionController', () => {
     })
   })
 
+  it('preserves feedback committed while external validation is awaiting', async () => {
+    const { controller, validator } = createController()
+    submit(controller, 'candidate-one', '1')
+    const entered = deferred()
+    const release = deferred()
+    validator.hook = async () => {
+      entered.resolve()
+      await release.promise
+    }
+
+    const validation = controller.validateCandidate('bfcl', 'candidate-one')
+    await entered.promise
+    controller.recordFeedback({
+      schema_version: EVOLUTION_FEEDBACK_SCHEMA_VERSION,
+      feedback_id: 'feedback-during-validation',
+      profile_id: 'bfcl',
+      candidate_id: 'h0',
+      benchmark: 'bfcl-v3',
+      split: 'B_search',
+      summary: 'Committed while the validator was running.',
+      failures: [],
+    })
+    release.resolve()
+    await validation
+
+    expect(controller.status('bfcl').state).toMatchObject({
+      feedback_ids: ['feedback-during-validation'],
+      current_feedback_id: 'feedback-during-validation',
+      open_candidate_id: 'candidate-one',
+    })
+  })
+
+  it.each([
+    {
+      schema_version: 'autodata-candidate-validation-1', candidate_id: 'unknown', ok: true,
+      plugin_id: 'bfcl-strategy', plugin_version: '1',
+    },
+    {
+      schema_version: 'autodata-candidate-validation-1', candidate_id: 'candidate-one', ok: true,
+      plugin_id: 'forged-strategy', plugin_version: '1',
+    },
+    {
+      schema_version: 'autodata-candidate-validation-1', candidate_id: 'candidate-one', ok: true,
+      plugin_id: 'bfcl-strategy', plugin_version: '1', extra: true,
+    },
+    {
+      schema_version: 'autodata-candidate-validation-1', candidate_id: 'candidate-one', ok: false,
+      reason: '   ',
+    },
+  ])('rejects a malformed injected Validator result without closing the candidate', async (forged) => {
+    const validator = {
+      async validate() { return forged as unknown as CandidateValidationResult },
+    }
+    const { controller } = setupController(validator)
+    submit(controller, 'candidate-one', '1')
+
+    await expect(controller.validateCandidate('bfcl', 'candidate-one'))
+      .rejects.toMatchObject({ code: 'VALIDATION_UNAVAILABLE' })
+    expect(controller.status('bfcl').state.open_candidate_id).toBe('candidate-one')
+    expect(controller.status('bfcl').state.candidates).toContainEqual(expect.objectContaining({
+      candidate_id: 'candidate-one', status: 'proposed',
+    }))
+  })
+
   it('durably rejects a candidate-specific activation failure', async () => {
     const { controller, runtime } = createController()
     submit(controller, 'candidate-one', '1')
@@ -210,6 +308,127 @@ describe('EvolutionController', () => {
     expect(outcome.status.state.candidates).toContainEqual(expect.objectContaining({
       candidate_id: 'candidate-one', status: 'rejected',
     }))
+  })
+
+  it('does not durably reject a generic runtime failure that lacks restoration proof', async () => {
+    const { controller, runtime } = createController()
+    submit(controller, 'candidate-one', '1')
+    await controller.validateCandidate('bfcl', 'candidate-one')
+    runtime.failActivation = 'ambiguous'
+
+    await expect(controller.recordEvaluation(report('candidate-one', 'h0', 0.5, 0.6), agent))
+      .rejects.toMatchObject({ code: 'RUNTIME_FAILED' })
+    expect(controller.status('bfcl').state).toMatchObject({
+      active_candidate_id: 'h0', open_candidate_id: 'candidate-one',
+    })
+  })
+
+  it('serializes profile operations and preserves feedback across activation', async () => {
+    const { controller, runtime } = createController()
+    submit(controller, 'candidate-one', '1')
+    await controller.validateCandidate('bfcl', 'candidate-one')
+    const entered = deferred()
+    const release = deferred()
+    runtime.activateHook = async () => {
+      entered.resolve()
+      await release.promise
+    }
+
+    const evaluation = controller.recordEvaluation(report('candidate-one', 'h0', 0.5, 0.6), agent)
+    await entered.promise
+    const resumed = controller.resume('bfcl', agent)
+    await Promise.resolve()
+    expect(runtime.ensured).toEqual([])
+    controller.recordFeedback({
+      schema_version: EVOLUTION_FEEDBACK_SCHEMA_VERSION,
+      feedback_id: 'feedback-during-activation',
+      profile_id: 'bfcl',
+      candidate_id: 'h0',
+      benchmark: 'bfcl-v3',
+      split: 'B_search',
+      summary: 'Committed while runtime activation was running.',
+      failures: [],
+    })
+    release.resolve()
+    await evaluation
+    await resumed
+
+    expect(runtime.ensured).toEqual(['candidate-one'])
+    expect(controller.status('bfcl').state).toMatchObject({
+      active_candidate_id: 'candidate-one',
+      feedback_ids: ['feedback-during-activation'],
+      current_feedback_id: null,
+    })
+  })
+
+  it('preserves feedback committed while rollback awaits the runtime', async () => {
+    const { controller, runtime } = createController()
+    submit(controller, 'candidate-one', '1')
+    await controller.validateCandidate('bfcl', 'candidate-one')
+    await controller.recordEvaluation(report('candidate-one', 'h0', 0.5, 0.6), agent)
+    const entered = deferred()
+    const release = deferred()
+    runtime.ensureHook = async () => {
+      entered.resolve()
+      await release.promise
+    }
+
+    const rollback = controller.rollback('bfcl', 'h0', agent)
+    await entered.promise
+    controller.recordFeedback({
+      schema_version: EVOLUTION_FEEDBACK_SCHEMA_VERSION,
+      feedback_id: 'feedback-during-rollback',
+      profile_id: 'bfcl',
+      candidate_id: 'candidate-one',
+      benchmark: 'bfcl-v3',
+      split: 'B_search',
+      summary: 'Committed while rollback was running.',
+      failures: [],
+    })
+    release.resolve()
+    await rollback
+
+    expect(controller.status('bfcl').state).toMatchObject({
+      active_candidate_id: 'h0',
+      feedback_ids: ['feedback-during-rollback'],
+      current_feedback_id: null,
+    })
+  })
+
+  it('treats failure to activate an accepted rollback target as degraded', async () => {
+    const { controller, runtime } = createController()
+    submit(controller, 'candidate-one', '1')
+    await controller.validateCandidate('bfcl', 'candidate-one')
+    await controller.recordEvaluation(report('candidate-one', 'h0', 0.5, 0.6), agent)
+    await controller.rollback('bfcl', 'h0', agent)
+    runtime.failActivation = 'candidate'
+
+    await expect(controller.rollback('bfcl', 'candidate-one', agent))
+      .rejects.toMatchObject({ code: 'RUNTIME_DEGRADED' })
+    expect(controller.status('bfcl').state.active_candidate_id).toBe('h0')
+  })
+
+  it('replays an evaluation record left before the state commit and is idempotent after commit', async () => {
+    const store = new FailEvaluationCommitStore()
+    const { controller, runtime } = createController(true, store)
+    submit(controller, 'candidate-one', '1')
+    await controller.validateCandidate('bfcl', 'candidate-one')
+    const evaluation = report('candidate-one', 'h0', 0.5, 0.6)
+    store.failNextEvaluationCommit = true
+
+    await expect(controller.recordEvaluation(evaluation, agent)).rejects.toMatchObject({ code: 'STORE_IO' })
+    expect(store.getEvaluation('bfcl', evaluation.report_id)?.decision).toMatchObject({ accepted: true })
+    expect(controller.status('bfcl').state.open_candidate_id).toBe('candidate-one')
+    expect(runtime.rolledBack).toEqual(['candidate-one'])
+
+    const replayed = await controller.recordEvaluation(evaluation, agent)
+    expect(replayed.decision).toMatchObject({ accepted: true })
+    expect(replayed.status.state.active_candidate_id).toBe('candidate-one')
+    expect(runtime.activated).toEqual(['candidate-one', 'candidate-one'])
+
+    const repeated = await controller.recordEvaluation(evaluation, agent)
+    expect(repeated.decision).toEqual(replayed.decision)
+    expect(runtime.activated).toEqual(['candidate-one', 'candidate-one'])
   })
 
   it.each(['unavailable', 'degraded'] as const)(
