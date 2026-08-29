@@ -19,7 +19,8 @@ AutoData 是为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harne
 直接 JavaScript DataPlugin 提案、普通 Node 子进程验证、B_dev 接受/回滚和
 重启恢复；Stage 3B 已用确定性 fake model 和真实 FreeRouter 模型分别驱动
 DSH Agent/Session/Tool loop，并验证直接候选提交，Gate 3 已完成。Python 训练
-和 GPU 评测仍延后到 Stage 4。
+和 GPU 评测由 [Stage 4A 兼容性闸门](docs/stage4a-gpu-gate.md) 接管；控制面与
+离线测试已实现，真实 H200 train/eval 尚未执行，因此目前不宣称 Gate 4A 已通过。
 
 ## 阶段二（Gate 2 已完成）
 
@@ -91,6 +92,16 @@ AutoData 会创建内置的 `default` Profile：benchmark 为 `autodata-fixture`
 `<profile-id>-strategy`。Profile 创建后不可变，相同配置重启会复用已有状态，
 修改 benchmark、指标、能力或策略 ID 必须使用新的 Profile ID。配置不会删除
 Store 中已有的历史 Profile，模型也没有创建或修改 Profile 的工具。
+
+## Stage 4A（H200 兼容性闸门）
+
+Stage 4A 是 Host-only API，不进入 `ctx.autodata`、模型工具列表或 capability
+清单。它固定执行四卡 H200、两步 Qwen3.5-9B 全参训练，再以单卡 H200、固定
+vLLM/BFCL 配置验证五个冻结 case。每一阶段严格按 RJob dry-run、predict-only
+`1/1`、submit 的顺序执行，并以确定性 RJob 名和原子 `state.json` 支持重启恢复。
+
+调用、状态目录、取消语义、依赖准备和真实执行前检查见
+[docs/stage4a-gpu-gate.md](docs/stage4a-gpu-gate.md)。
 
 ## 环境要求
 

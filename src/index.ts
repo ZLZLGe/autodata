@@ -4,6 +4,11 @@ export {
   AutoDataService,
   DEFAULT_TASK_PROFILE,
   getEvolutionController,
+  getStage4AController,
+  startStage4A,
+  statusStage4A,
+  cancelStage4A,
+  resumeStage4A,
   type AutoDataServiceOptions,
   type AutoDataStatus,
 } from './service.js'
@@ -45,4 +50,5 @@ export {
 } from './core/index.js'
 export type * from './core/types.js'
 export * from './evolution/index.js'
+export * from './stage4a/index.js'
 export { default } from './service.js'

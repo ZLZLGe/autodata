@@ -21,6 +21,12 @@ import {
   type TaskProfile,
   type TaskProfileInput,
 } from './evolution/types.js'
+import { Stage4AController } from './stage4a/controller.js'
+import type {
+  Stage4AControllerOptions,
+  Stage4AStartRequest,
+  Stage4AStatus,
+} from './stage4a/types.js'
 
 /** AutoData package version exposed by the Stage 1 service contract. */
 export const AUTODATA_VERSION = '0.1.0-rc.1'
@@ -67,6 +73,8 @@ export interface AutoDataServiceOptions {
   readonly store?: EvolutionStore
   readonly validator?: CandidateValidator
   readonly runtime?: EvolutionRuntime
+  /** Host-only Stage 4A paths and test seams; never exposed through ctx.autodata. */
+  readonly stage4a?: Stage4AControllerOptions
 }
 
 /** The zero-configuration profile used only when the Store is initially empty. */
@@ -97,6 +105,7 @@ const AUTO_DATA_SERVICE_CONFIG = {
 }
 
 const evolutionControllers = new WeakMap<AutoDataService, EvolutionController>()
+const stage4AControllers = new WeakMap<AutoDataService, Stage4AController>()
 const CORDIS_ORIGINAL = Symbol.for('cordis.original')
 
 function originalAutoDataService(service: AutoDataService): AutoDataService {
@@ -114,6 +123,38 @@ export function getEvolutionController(ctx: Context): EvolutionController {
     throw new EvolutionError('AutoData evolution controller is unavailable', 'RUNTIME_UNAVAILABLE')
   }
   return controller
+}
+
+/** Trusted Host accessor. Stage 4A is deliberately absent from ctx.autodata and model tools. */
+export function getStage4AController(ctx: Context): Stage4AController {
+  const service = ctx.get('autodata', false) as AutoDataService | undefined
+  const controller = service === undefined
+    ? undefined
+    : stage4AControllers.get(originalAutoDataService(service))
+  if (controller === undefined) {
+    throw new EvolutionError('AutoData Stage 4A controller is unavailable', 'RUNTIME_UNAVAILABLE')
+  }
+  return controller
+}
+
+/** Start a new Host-owned compatibility run. */
+export function startStage4A(ctx: Context, request: Stage4AStartRequest): Stage4AStatus {
+  return getStage4AController(ctx).start(request)
+}
+
+/** Read durable Stage 4A status without consuming DSH job output. */
+export function statusStage4A(ctx: Context, profileId: string, runId: string): Stage4AStatus {
+  return getStage4AController(ctx).status(profileId, runId)
+}
+
+/** Cancel the live or remotely recoverable RJob for one run. */
+export function cancelStage4A(ctx: Context, profileId: string, runId: string): Promise<Stage4AStatus> {
+  return getStage4AController(ctx).cancel(profileId, runId)
+}
+
+/** Resume monitoring from durable state without blindly repeating a submission. */
+export function resumeStage4A(ctx: Context, profileId: string, runId: string): Stage4AStatus {
+  return getStage4AController(ctx).resume(profileId, runId)
 }
 
 /** AutoData's in-memory data Core mounted into the shared DSH Cordis context. */
@@ -145,6 +186,19 @@ export class AutoDataService extends Service {
     const configuredProfiles = options.profiles
       ?? (existingProfiles.length === 0 ? [DEFAULT_TASK_PROFILE] : existingProfiles)
     controller.ensureProfiles(configuredProfiles)
+
+    const stage4a = new Stage4AController(ctx, {
+      ...options.stage4a,
+      profile_exists: profileId => controller.profiles().some(profile => profile.id === profileId),
+    })
+    stage4AControllers.set(originalAutoDataService(this), stage4a)
+    this.ctx.effect(() => async () => {
+      try {
+        await stage4a.dispose()
+      } finally {
+        stage4AControllers.delete(originalAutoDataService(this))
+      }
+    }, 'autodata.stage4a-controller')
   }
 
   /** Return deterministic in-memory status without reading project or run data. */
@@ -267,7 +321,7 @@ function normalizeServiceOptions(value: unknown): AutoDataServiceOptions {
     throw new TypeError('AutoData service config must be an object')
   }
   const input = value as Record<string, unknown>
-  const allowed = new Set(['profiles', 'store', 'validator', 'runtime'])
+  const allowed = new Set(['profiles', 'store', 'validator', 'runtime', 'stage4a'])
   const extra = Object.keys(input).find(key => !allowed.has(key))
   if (extra !== undefined) throw new TypeError(`AutoData service config has unsupported field ${extra}`)
 
@@ -292,6 +346,7 @@ function normalizeServiceOptions(value: unknown): AutoDataServiceOptions {
     ...(input.store === undefined ? {} : { store: input.store as EvolutionStore }),
     ...(input.validator === undefined ? {} : { validator: input.validator as CandidateValidator }),
     ...(input.runtime === undefined ? {} : { runtime: input.runtime as EvolutionRuntime }),
+    ...(input.stage4a === undefined ? {} : { stage4a: input.stage4a as Stage4AControllerOptions }),
   }
 }
 

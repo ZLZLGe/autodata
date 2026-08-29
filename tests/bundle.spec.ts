@@ -28,6 +28,7 @@ describe('AutoData bundle manifest', () => {
     expect(manifest.exports).toHaveProperty('./service')
     expect(manifest.exports).toHaveProperty('./tool')
     expect(manifest.exports).toHaveProperty('./evolution')
+    expect(manifest.exports).toHaveProperty('./stage4a')
   })
 
   it('declares only the DSH APIs imported at runtime as exact peers', () => {
@@ -35,6 +36,8 @@ describe('AutoData bundle manifest', () => {
     expect(manifest.peerDependencies).toEqual({
       '@deepseek-ai/cordis': '4.0.1',
       '@deepseek-ai/dsh-cordis-host-runner': '0.1.1-rc.2',
+      '@deepseek-ai/dsh-jobs': '0.1.1-rc.2',
+      '@deepseek-ai/dsh-subprocess': '0.1.1-rc.2',
       '@deepseek-ai/dsh-system-prompt': '0.1.1-rc.2',
       '@deepseek-ai/dsh-tools': '0.1.1-rc.2',
     })
@@ -44,7 +47,7 @@ describe('AutoData bundle manifest', () => {
     const patch = yaml.load(readFileSync(resolve(root, 'cordis.patch.yml'), 'utf8'))
     expect(patch).toEqual([{
       insert: [
-        { id: 'autodata-service', name: '@zlzlge/autodata/service' },
+        { id: 'autodata-service', name: '@zlzlge/autodata/service', inject: ['jobs', 'subprocess'] },
         { id: 'autodata-tool', name: '@zlzlge/autodata/tool' },
       ],
     }])

@@ -1,6 +1,9 @@
 - insert:
     - id: autodata-service
       name: '@zlzlge/autodata/service'
+      inject:
+        - jobs
+        - subprocess
 
     - id: autodata-tool
       name: '@zlzlge/autodata/tool'
