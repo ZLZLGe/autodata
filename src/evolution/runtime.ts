@@ -1,6 +1,15 @@
 import type { Context, Fiber } from '@deepseek-ai/cordis'
 import type DynamicCordisRunnerService from '@deepseek-ai/dsh-cordis-host-runner'
-import { runEvolutionFixture, type EvolutionDataHost } from './fixture.js'
+import { canonicalJson } from '../core/json.js'
+import {
+  candidateFrozenSelectionRuntimeBinding,
+  candidateRuntimeHostSource,
+} from './candidate-sandbox.js'
+import {
+  runEvolutionFixture,
+  runFrozenSelectionRuntimeSelfCheck,
+  type EvolutionDataHost,
+} from './fixture.js'
 import {
   EvolutionError,
   H0_CANDIDATE_ID,
@@ -116,6 +125,8 @@ export class DshEvolutionRuntime implements EvolutionRuntime {
       && current.runner === runner
       && current.agent === agent
       && current.activeCandidate.manifest.candidate_id === candidate.manifest.candidate_id
+      && current.activeCandidate.host_source === candidate.host_source
+      && canonicalJson(current.activeCandidate.manifest) === canonicalJson(candidate.manifest)
       && this.isSlotActive(current)
       && this.hasExpectedStrategy(profile, candidate)
     ) {
@@ -184,7 +195,7 @@ export class DshEvolutionRuntime implements EvolutionRuntime {
         plugin: { kind: 'existing', pluginId: slot.pluginId },
         name: candidate.manifest.candidate_id,
         purpose: candidate.manifest.description ?? `AutoData candidate for ${profile.id}`,
-        code: { host: candidate.host_source },
+        code: { host: candidateRuntimeHostSource(profile, candidate) },
       })
       packageId = receipt.packageId
       slot.packages.set(candidate.manifest.candidate_id, packageId)
@@ -278,7 +289,7 @@ export class DshEvolutionRuntime implements EvolutionRuntime {
         plugin: { kind: 'new', idPrefix: 'auto' },
         name: candidate.manifest.candidate_id,
         purpose: candidate.manifest.description ?? `AutoData candidate for ${profile.id}`,
-        code: { host: candidate.host_source },
+        code: { host: candidateRuntimeHostSource(profile, candidate) },
       })
       slot = {
         profile,
@@ -638,9 +649,14 @@ export class DshEvolutionRuntime implements EvolutionRuntime {
 
   private runFixture(profile: TaskProfile, candidate: CandidatePackage): void {
     try {
-      runEvolutionFixture(this.host, profile.id, candidate.manifest.generation, profile.strategy_plugin_id)
+      const binding = candidateFrozenSelectionRuntimeBinding(profile, candidate)
+      if (binding === null) {
+        runEvolutionFixture(this.host, profile.id, candidate.manifest.generation, profile.strategy_plugin_id)
+      } else {
+        runFrozenSelectionRuntimeSelfCheck(this.host, binding)
+      }
     } catch (error) {
-      throw new EvolutionError('candidate failed the fixed runtime fixture', 'RUNTIME_FAILED', {
+      throw new EvolutionError('candidate failed its bounded runtime self-check', 'RUNTIME_FAILED', {
         profile_id: profile.id,
         candidate_id: candidate.manifest.candidate_id,
         cause: error,

@@ -99,6 +99,87 @@ describe('candidate process validator', () => {
     expect(wrongVersion.reason).toMatch(/bfcl-strategy@1/iu)
   })
 
+  it('rejects direct, computed, and aliased access outside ctx.autodata.register', async () => {
+    const probes = [
+      "ctx.get('dynamicCordisRunner')",
+      "ctx['g' + 'et']('jobs')",
+      "(() => { const alias = ctx; alias.provide('candidate-leak', {}) })()",
+      "ctx['o' + 'n']('candidate-event', () => {})",
+      'ctx.effect(() => {})',
+      'void ctx.tools',
+      'void ctx.autodata.plugins',
+      "ctx['time' + 'out'](() => {}, 1)",
+    ]
+
+    for (const probe of probes) {
+      const result = await validator().validate(profile, candidate(`
+        return {
+          inject: ['autodata'],
+          apply(ctx) {
+            ${probe}
+            ctx.autodata.register({
+              id: 'bfcl-strategy', version: '1',
+              run(input) { return input.map(item => ({ record_id: item.record.source.record_id })) },
+            })
+          },
+        }
+      `))
+      expect(result, probe).toMatchObject({ ok: false })
+      expect(result.reason, probe).toMatch(/exposes only ctx\.autodata\.register/iu)
+    }
+  })
+
+  it('allows computed aliases of the one capability without exposing Host-realm constructors', async () => {
+    const result = await validator().validate(profile, candidate(`
+      return {
+        inject: ['autodata'],
+        apply(ctx) {
+          const autodata = ctx['auto' + 'data']
+          const register = autodata['reg' + 'ister']
+          const escaped = register.constructor('return typeof process === "undefined" ? null : process')()
+          if (escaped !== null) throw new Error('Host process escaped through register')
+          register({
+            id: 'bfcl-strategy', version: '1',
+            run(input) {
+              let hostProcess = null
+              try {
+                hostProcess = input.constructor.constructor(
+                  'return typeof process === "undefined" ? null : process',
+                )()
+              } catch {}
+              if (hostProcess !== null) return [{ record_id: 'host-realm-escape' }]
+              return input.map(item => ({ record_id: item.record.source.record_id }))
+            },
+          })
+        },
+      }
+    `))
+
+    expect(result).toMatchObject({
+      candidate_id: 'candidate-1',
+      ok: true,
+      plugin_id: 'bfcl-strategy',
+      plugin_version: '1',
+    })
+  })
+
+  it('rejects accessor-based plugin shapes without invoking their getters', async () => {
+    const result = await validator().validate(profile, candidate(`
+      let getterRan = false
+      return {
+        inject: ['autodata'],
+        get apply() {
+          getterRan = true
+          throw new Error('accessor executed')
+        },
+      }
+    `))
+
+    expect(result).toMatchObject({ ok: false })
+    expect(result.reason).toMatch(/apply must be an own data property/iu)
+    expect(result.reason).not.toMatch(/accessor executed/iu)
+  })
+
   it('rejects additional DataPlugins, tool side effects, and fixture failures', async () => {
     const additionalPlugin = await validator().validate(profile, candidate(`
       return {

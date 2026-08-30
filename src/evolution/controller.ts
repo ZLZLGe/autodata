@@ -248,9 +248,25 @@ export class EvolutionController {
     }
     const candidate: CandidatePackage = { manifest, host_source: input.host_source }
     const next = proposeCandidate(snapshot.profile, snapshot.state, manifest)
+    const orphan = this.store.getCandidate(profileId, input.candidate_id)
+
+    if (orphan !== undefined) {
+      const sameManifest = canonicalJson(orphan.manifest) === canonicalJson(candidate.manifest)
+      if (!sameManifest || orphan.host_source !== candidate.host_source) {
+        throw new EvolutionError(`candidate ${input.candidate_id} already exists with different content`, 'CANDIDATE_EXISTS', {
+          profile_id: profileId,
+          candidate_id: input.candidate_id,
+        })
+      }
+      // saveCandidate() is append-only, so an identical unreferenced package
+      // is proof that a prior submission crashed before committing state.json.
+      // Complete that original transition without rewriting the artifact.
+      this.store.saveState(next)
+      return this.status(profileId)
+    }
 
     // Candidate files are append-only. A crash between these writes leaves an
-    // unreferenced artifact which the Store intentionally ignores.
+    // unreferenced artifact which an identical replay can commit above.
     this.store.saveCandidate(candidate)
     this.store.saveState(next)
     return this.status(profileId)
@@ -310,14 +326,57 @@ export class EvolutionController {
     })
   }
 
+  /** Fail closed when a formal experiment terminates without a usable evaluation. */
+  abandonCandidate(profileId: string, candidateId: string): EvolutionStatus {
+    this.assertUsable()
+    const snapshot = this.store.loadConsistentSnapshot(profileId)
+    const candidate = this.requireStateCandidate(snapshot.state, candidateId)
+    if (
+      candidate.status === 'rejected'
+      && snapshot.state.open_candidate_id === null
+      && snapshot.state.active_candidate_id !== candidateId
+    ) return this.status(profileId)
+    if (
+      snapshot.state.open_candidate_id !== candidateId
+      || candidate.parent_candidate_id !== snapshot.state.active_candidate_id
+      || (candidate.status !== 'proposed' && candidate.status !== 'validated')
+    ) {
+      throw new EvolutionError(`candidate ${candidateId} cannot be abandoned from its durable state`, 'CANDIDATE_STATE', {
+        profile_id: profileId,
+        candidate_id: candidateId,
+      })
+    }
+    this.store.saveState(rejectCandidate(snapshot.state, candidateId))
+    return this.status(profileId)
+  }
+
   /** Append Host-authored B_search feedback for the currently active version. */
   recordFeedback(feedbackInput: EvolutionFeedback): EvolutionFeedback {
     this.assertUsable()
     const feedback = normalizeEvolutionFeedback(feedbackInput)
     const snapshot = this.store.loadConsistentSnapshot(feedback.profile_id)
+    const existing = this.store.getFeedback(feedback.profile_id, feedback.feedback_id)
+
+    if (existing !== undefined) {
+      if (canonicalJson(existing) !== canonicalJson(feedback)) {
+        throw new EvolutionError(`feedback ${feedback.feedback_id} already exists with different content`, 'FEEDBACK_EXISTS', {
+          profile_id: feedback.profile_id,
+          candidate_id: feedback.candidate_id,
+        })
+      }
+      if (snapshot.state.feedback_ids.includes(feedback.feedback_id)) return feedback
+
+      // saveFeedback() is append-only. An identical record not referenced by
+      // state.json proves that an earlier call crashed between the two writes;
+      // complete that transition without rewriting the immutable artifact.
+      const recovered = recordEvolutionFeedback(snapshot.state, feedback)
+      this.store.saveState(recovered)
+      return feedback
+    }
+
     const next = recordEvolutionFeedback(snapshot.state, feedback)
-    // Write the immutable record first. If state persistence fails it is an
-    // orphan and will be ignored; IDs remain occupied and cannot be reused.
+    // Write the immutable record first. If state persistence fails, an
+    // identical replay above can safely attach the orphan to state.json.
     this.store.saveFeedback(feedback)
     this.store.saveState(next)
     return feedback
@@ -348,6 +407,13 @@ export class EvolutionController {
       const existing = this.store.getEvaluation(report.profile_id, report.report_id)
       const committed = this.committedEvaluationDecision(snapshot.state, report, existing)
       if (committed !== undefined) {
+        // A durable decision can be replayed by a fresh Controller whose
+        // process-local runtime is still at H0. When the caller supplies the
+        // live Agent, treat the replay as recovery and reconcile runtime with
+        // the Store before reporting success.
+        if (agent !== undefined) {
+          await this.ensureDurableActive(snapshot.profile, snapshot.state, snapshot.candidate_packages, agent)
+        }
         return Object.freeze({ decision: committed, status: this.status(report.profile_id) })
       }
       this.assertMatchingEvaluationRecord(report, existing)
@@ -506,14 +572,7 @@ export class EvolutionController {
   async resume(profileId: string, agent: EvolutionRuntimeAgent): Promise<EvolutionStatus> {
     return this.withProfileMutation(profileId, async () => {
       const snapshot = this.store.loadConsistentSnapshot(profileId)
-      const active = this.activePackage(snapshot.state, snapshot.candidate_packages)
-      await this.requireRuntime().ensureActive(snapshot.profile, active, agent)
-      const refreshed = this.store.loadConsistentSnapshot(profileId)
-      if (refreshed.state.active_candidate_id !== snapshot.state.active_candidate_id) {
-        throw new EvolutionError('active candidate changed while runtime resume was running', 'RUNTIME_STATE', {
-          profile_id: profileId,
-        })
-      }
+      await this.ensureDurableActive(snapshot.profile, snapshot.state, snapshot.candidate_packages, agent)
       return this.status(profileId)
     })
   }
@@ -679,6 +738,22 @@ export class EvolutionController {
   private activePackage(state: EvolutionState, candidates: readonly CandidatePackage[]): CandidatePackage | null {
     if (state.active_candidate_id === H0_CANDIDATE_ID) return null
     return this.requireCandidate(candidates, state.profile_id, state.active_candidate_id)
+  }
+
+  private async ensureDurableActive(
+    profile: TaskProfile,
+    state: EvolutionState,
+    candidates: readonly CandidatePackage[],
+    agent: EvolutionRuntimeAgent,
+  ): Promise<void> {
+    const active = this.activePackage(state, candidates)
+    await this.requireRuntime().ensureActive(profile, active, agent)
+    const refreshed = this.store.loadConsistentSnapshot(profile.id)
+    if (refreshed.state.active_candidate_id !== state.active_candidate_id) {
+      throw new EvolutionError('active candidate changed while runtime recovery was running', 'RUNTIME_STATE', {
+        profile_id: profile.id,
+      })
+    }
   }
 
   private requireCandidate(

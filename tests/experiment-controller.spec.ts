@@ -12,13 +12,17 @@ import {
   LOGICAL_TRAINING_UNIT_SCHEMA_VERSION,
 } from '../src/core/index.js'
 import { canonicalJson } from '../src/core/json.js'
-import type { DataRunResult } from '../src/core/types.js'
+import type { DataRunResult, JsonObject } from '../src/core/types.js'
+import { createFrozenSelectionRuntimeBinding } from '../src/evolution/candidate-sandbox.js'
 import { EvolutionController } from '../src/evolution/controller.js'
 import { MemoryEvolutionStore } from '../src/evolution/store.js'
 import type { CandidateValidator } from '../src/evolution/validator.js'
+import type { EvolutionRuntime, EvolutionRuntimeAgent, RuntimeActivation } from '../src/evolution/runtime.js'
+import type { CandidatePackage, TaskProfile } from '../src/evolution/types.js'
 import { ExperimentController } from '../src/experiment/controller.js'
 import { EXPERIMENT_PREDICTION_VERSION } from '../src/experiment/predictions.js'
 import { experimentRJobName } from '../src/experiment/state.js'
+import { GENERATION_MATERIALIZATION_VERSION } from '../src/generation/types.js'
 import {
   EXPERIMENT_CONTRACT_VERSION,
   EXPERIMENT_EVAL_RESULT_VERSION,
@@ -93,6 +97,92 @@ function fixtureData(): DataRunResult {
       validation_warning_counts: {},
     },
   }
+}
+
+function candidateData(data: DataRunResult, pluginId: string, version: string): DataRunResult {
+  const logical = data.logical_training_view.slice(0, 10).map((unit, index) => ({
+    ...unit,
+    selection_rank: index,
+    plugin_provenance: [{ plugin_id: pluginId, plugin_version: version, note: `rank-${String(index)}` }],
+  }))
+  return {
+    canonical_records: data.canonical_records,
+    logical_training_view: logical,
+    summary: {
+      ...data.summary,
+      harness_id: `${pluginId}-h1`,
+      generation: 1,
+      plugins: [{ id: pluginId, version }],
+      counts: { ...data.summary.counts, logical_training_units: logical.length },
+    },
+  }
+}
+
+async function submitFormalCandidate(
+  evolution: EvolutionController,
+  baselineData: DataRunResult,
+  candidateId: string,
+  hostSource: string,
+) {
+  const profile = evolution.status('bfcl-v4').profile
+  const strategyVersion = '1'
+  const dataRun = candidateData(baselineData, profile.strategy_plugin_id, strategyVersion)
+  const files = dataFiles(dataRun)
+  const selectedRecordIds = dataRun.logical_training_view.map(unit => unit.source.record_id)
+  const materializationSha256 = hash(canonicalJson({
+    schema_version: GENERATION_MATERIALIZATION_VERSION,
+    candidate_id: candidateId,
+    host_source_sha256: hash(hostSource),
+    source_pool_sha256: hash(files.canonical),
+    canonical_jsonl_sha256: hash(files.canonical),
+    logical_view_jsonl_sha256: hash(files.logical),
+    run_summary_json_sha256: hash(files.summary),
+    selected_record_ids: selectedRecordIds,
+    data_run: dataRun,
+  }))
+  const binding = createFrozenSelectionRuntimeBinding({
+    profile_id: profile.id,
+    candidate_id: candidateId,
+    generation: 1,
+    parent_candidate_id: 'h0',
+    plugin_id: profile.strategy_plugin_id,
+    strategy_version: strategyVersion,
+    host_source_sha256: hash(hostSource),
+    source_pool_sha256: hash(files.canonical),
+    materialization_sha256: materializationSha256,
+    harness_id: dataRun.summary.harness_id,
+    seed: dataRun.summary.seed,
+    source: dataRun.summary.source,
+    source_record_ids: dataRun.canonical_records.map(record => record.source.record_id),
+    decisions: dataRun.logical_training_view.map(unit => ({
+      record_id: unit.source.record_id,
+      ...(unit.plugin_provenance[0]?.note === undefined ? {} : { note: unit.plugin_provenance[0].note }),
+    })),
+  })
+  evolution.submitCandidate(profile.id, {
+    candidate_id: candidateId,
+    strategy_version: strategyVersion,
+    host_source: hostSource,
+    metadata: {
+      generation_run_id: `generation-${candidateId}`,
+      source_sha256: hash(hostSource),
+      materialization_sha256: materializationSha256,
+      runtime_binding: binding as unknown as JsonObject,
+    },
+  })
+  await evolution.validateCandidate(profile.id, candidateId)
+  return Object.freeze({
+    dataRun,
+    subject: Object.freeze({
+      candidate_id: candidateId,
+      generation: 1,
+      plugin_id: profile.strategy_plugin_id,
+      strategy_version: strategyVersion,
+      host_source_sha256: hash(hostSource),
+      runtime_plan_sha256: binding.runtime_plan_sha256,
+      materialization_sha256: binding.materialization_sha256,
+    }),
+  })
 }
 
 function dataFiles(data: DataRunResult) {
@@ -297,6 +387,7 @@ class Backend implements ExperimentRJobBackend {
   invalidFirstTrainResult = false
   ambiguousFirstTrainSubmit = false
   predictionCorruption?: 'malformed' | 'truncated' | 'divergent'
+  evalScore: 0.8 | 1 = 0.8
   private firstTrainInspected = false
 
   async dryRun(spec: Stage4ARJobSpec): Promise<ExperimentCommandResult> {
@@ -389,11 +480,11 @@ class Backend implements ExperimentRJobBackend {
     const cases = ['B_search', 'B_dev'].flatMap(split => (request.benchmark.case_ids[split] as string[]).map(caseId => {
       const category = [...categories].sort((left, right) => right.length - left.length)
         .find(value => caseId.startsWith(`${value}_`)) as string
-      const passed = !caseId.endsWith('_0')
+      const passed = this.evalScore === 1 || !caseId.endsWith('_0')
       return { case_id: caseId, split, category, passed, failure_summary: passed ? null : 'fixture failure' }
     }))
     const categoryScores = Object.fromEntries(['B_search', 'B_dev'].map(split => [split,
-      Object.fromEntries(categories.map(category => [category, 0.8])),
+      Object.fromEntries(categories.map(category => [category, this.evalScore])),
     ]))
     const predictions = cases.map(value => ({
       schema_version: EXPERIMENT_PREDICTION_VERSION,
@@ -425,11 +516,34 @@ class Backend implements ExperimentRJobBackend {
       },
       cases,
       category_scores: categoryScores,
-      macro_scores: { B_search: 0.8, B_dev: 0.8 },
+      macro_scores: { B_search: this.evalScore, B_dev: this.evalScore },
       predictions_path: output.predictions_jsonl,
       failure: null,
     })}\n`, { flag: 'wx' })
   }
+}
+
+class CandidateRuntime implements EvolutionRuntime {
+  readonly activated: string[] = []
+  readonly ensured: Array<string | null> = []
+
+  async ensureActive(
+    _profile: TaskProfile,
+    candidate: CandidatePackage | null,
+  ): Promise<void> {
+    this.ensured.push(candidate?.manifest.candidate_id ?? null)
+  }
+
+  async activate(
+    _profile: TaskProfile,
+    _current: CandidatePackage | null,
+    candidate: CandidatePackage,
+  ): Promise<RuntimeActivation> {
+    this.activated.push(candidate.manifest.candidate_id)
+    return { async rollback() {} }
+  }
+
+  async dispose(): Promise<void> {}
 }
 
 class CancellationBackend extends Backend {
@@ -475,9 +589,21 @@ async function fixture(
   const root = await mkdtemp(join(tmpdir(), 'autodata-experiment-'))
   const data = fixtureData()
   const assets = await makeAssets(root, data)
+  const runtime = new CandidateRuntime()
   const evolution = new EvolutionController({
     store: new MemoryEvolutionStore(),
-    validator: { async validate() { throw new Error('not used') } } satisfies CandidateValidator,
+    validator: {
+      async validate(profile, candidate) {
+        return {
+          schema_version: 'autodata-candidate-validation-1',
+          candidate_id: candidate.manifest.candidate_id,
+          ok: true,
+          plugin_id: profile.strategy_plugin_id,
+          plugin_version: candidate.manifest.strategy_version,
+        }
+      },
+    } satisfies CandidateValidator,
+    runtime,
   })
   evolution.createProfile({
     id: 'bfcl-v4',
@@ -497,7 +623,7 @@ async function fixture(
     jobs,
     ...(options.sleep === undefined ? {} : { sleep: options.sleep }),
   })
-  return { root, data, evolution, jobs, controller, backend, assets }
+  return { root, data, evolution, jobs, controller, backend, assets, runtime }
 }
 
 describe('Stage 4B ExperimentController', () => {
@@ -559,6 +685,257 @@ describe('Stage 4B ExperimentController', () => {
 
     expect(() => controller.start({ profile_id: 'bfcl-v4', run_id: 'second-baseline', data_run: data }))
       .toThrowError(/already has a registered H0 baseline/iu)
+    await controller.dispose()
+  })
+
+  it('freezes and decides one validated H1 without replacing H0 feedback on rejection', async () => {
+    const { controller, jobs, evolution, data, root } = await fixture()
+    const baseline = controller.start({ profile_id: 'bfcl-v4', run_id: 'baseline-for-h1', data_run: data })
+    expect((await jobs.done(baseline.job_id as JobId)).status).toBe('completed')
+    const hostSource = 'return { inject: ["autodata"], apply() {} }'
+    const { dataRun, subject } = await submitFormalCandidate(
+      evolution,
+      data,
+      'candidate-one',
+      hostSource,
+    )
+    const started = controller.start({
+      profile_id: 'bfcl-v4',
+      run_id: 'candidate-one-run',
+      data_run: dataRun,
+      subject,
+    }, { id: 'experiment-agent' } as EvolutionRuntimeAgent)
+    expect((await jobs.done(started.job_id as JobId)).status).toBe('completed')
+
+    const state = controller.status('bfcl-v4', 'candidate-one-run').state
+    expect(state).toMatchObject({
+      status: 'succeeded',
+      phase: 'complete',
+      candidate_id: 'candidate-one',
+      candidate_generation: 1,
+      decision: { candidate_id: 'candidate-one', accepted: false, reason: 'not_strictly_better' },
+    })
+    expect(state.feedback_id).toBeUndefined()
+    const contract = JSON.parse(readFileSync(resolve(state.run_directory, 'experiment-contract.json'), 'utf8')) as Record<string, any>
+    expect(contract).toMatchObject({
+      contract_id: 'stage4c-candidate-1',
+      subject,
+      data: { canonical_records: 100, logical_training_units: 10 },
+    })
+    expect(contract.data.canonical_jsonl_sha256).toBe(JSON.parse(readFileSync(
+      resolve(root, 'runs/bfcl-v4/baseline-for-h1/experiment-contract.json'),
+      'utf8',
+    )).data.canonical_jsonl_sha256)
+    expect(existsSync(resolve(root, 'staging/candidate-one-run/bfcl/test.jsonl'))).toBe(false)
+    expect(evolution.status('bfcl-v4').state).toMatchObject({
+      active_candidate_id: 'h0',
+      open_candidate_id: null,
+      current_feedback_id: expect.stringMatching(/^h0-search-/u),
+    })
+    expect(evolution.status('bfcl-v4').state.candidates.find(value => value.candidate_id === 'candidate-one'))
+      .toMatchObject({ status: 'rejected', evaluation: { score: 0.8 } })
+    await controller.dispose()
+  })
+
+  it.each(['runtime_plan_sha256', 'materialization_sha256'] as const)(
+    'rejects an H1 subject whose %s differs from the durable candidate binding',
+    async field => {
+      const { controller, jobs, evolution, data } = await fixture()
+      const baseline = controller.start({
+        profile_id: 'bfcl-v4',
+        run_id: `baseline-for-bad-${field.replaceAll('_', '-')}`,
+        data_run: data,
+      })
+      expect((await jobs.done(baseline.job_id as JobId)).status).toBe('completed')
+      const formal = await submitFormalCandidate(
+        evolution,
+        data,
+        `candidate-bad-${field === 'runtime_plan_sha256' ? 'runtime' : 'materialization'}`,
+        'return { inject: ["autodata"], apply() {} }',
+      )
+
+      expect(() => controller.start({
+        profile_id: 'bfcl-v4',
+        run_id: `bad-${field.replaceAll('_', '-')}`,
+        data_run: formal.dataRun,
+        subject: { ...formal.subject, [field]: '0'.repeat(64) },
+      }, { id: 'experiment-agent' } as EvolutionRuntimeAgent)).toThrowError(
+        /subject does not match the durable candidate package/iu,
+      )
+      await controller.dispose()
+    },
+  )
+
+  it('rejects an H1 data_run that differs from the candidate frozen materialization', async () => {
+    const { controller, jobs, evolution, data } = await fixture()
+    const baseline = controller.start({
+      profile_id: 'bfcl-v4',
+      run_id: 'baseline-for-mismatched-materialization',
+      data_run: data,
+    })
+    expect((await jobs.done(baseline.job_id as JobId)).status).toBe('completed')
+    const formal = await submitFormalCandidate(
+      evolution,
+      data,
+      'candidate-mismatched-materialization',
+      'return { inject: ["autodata"], apply() {} }',
+    )
+    const replacementLogicalView = data.logical_training_view.slice(10, 20).map((unit, index) => ({
+      ...unit,
+      selection_rank: index,
+      plugin_provenance: [{
+        plugin_id: formal.subject.plugin_id,
+        plugin_version: formal.subject.strategy_version,
+        note: `replacement-${String(index)}`,
+      }],
+    }))
+    const mismatchedDataRun: DataRunResult = {
+      ...formal.dataRun,
+      logical_training_view: replacementLogicalView,
+      summary: {
+        ...formal.dataRun.summary,
+        counts: {
+          ...formal.dataRun.summary.counts,
+          logical_training_units: replacementLogicalView.length,
+        },
+      },
+    }
+
+    expect(() => controller.start({
+      profile_id: 'bfcl-v4',
+      run_id: 'mismatched-materialization',
+      data_run: mismatchedDataRun,
+      subject: formal.subject,
+    }, { id: 'experiment-agent' } as EvolutionRuntimeAgent)).toThrowError(
+      /does not match the candidate frozen materialization/iu,
+    )
+    await controller.dispose()
+  })
+
+  it('activates a strictly better H1 and persists the exact acceptance decision', async () => {
+    const backend = new Backend()
+    const { controller, jobs, evolution, data, runtime } = await fixture(backend)
+    const baseline = controller.start({ profile_id: 'bfcl-v4', run_id: 'baseline-for-accepted-h1', data_run: data })
+    expect((await jobs.done(baseline.job_id as JobId)).status).toBe('completed')
+    const hostSource = 'return { inject: ["autodata"], apply() {} }'
+    const formal = await submitFormalCandidate(evolution, data, 'candidate-better', hostSource)
+    backend.evalScore = 1
+    const started = controller.start({
+      profile_id: 'bfcl-v4',
+      run_id: 'candidate-better-run',
+      data_run: formal.dataRun,
+      subject: formal.subject,
+    }, { id: 'experiment-agent' } as EvolutionRuntimeAgent)
+    expect((await jobs.done(started.job_id as JobId)).status).toBe('completed')
+
+    const state = controller.status('bfcl-v4', 'candidate-better-run').state
+    expect(state.decision).toEqual({
+      candidate_id: 'candidate-better',
+      accepted: true,
+      reason: 'accepted_strict_improvement',
+      split: 'B_dev',
+      metric: 'equal_category_accuracy',
+      candidate_score: 1,
+      baseline_score: 0.8,
+    })
+    expect(JSON.parse(readFileSync(state.decision_path as string, 'utf8'))).toEqual(state.decision)
+    expect(evolution.status('bfcl-v4').state.active_candidate_id).toBe('candidate-better')
+    expect(runtime.activated).toEqual(['candidate-better'])
+    expect(() => controller.resume('bfcl-v4', 'candidate-better-run'))
+      .toThrowError(/requires a process-local runtime Agent/iu)
+
+    const replayed = controller.resume(
+      'bfcl-v4',
+      'candidate-better-run',
+      { id: 'replacement-experiment-agent' } as EvolutionRuntimeAgent,
+    )
+    expect(replayed.job_id).toBeDefined()
+    expect((await jobs.done(replayed.job_id as JobId)).status).toBe('completed')
+    expect(runtime.ensured).toContain('candidate-better')
+    expect(controller.status('bfcl-v4', 'candidate-better-run').state.status).toBe('succeeded')
+    await controller.dispose()
+  })
+
+  it('replays an H1 decision idempotently after a crash at the commit boundary', async () => {
+    const { controller, jobs, evolution, data } = await fixture()
+    const baseline = controller.start({ profile_id: 'bfcl-v4', run_id: 'baseline-for-h1-replay', data_run: data })
+    expect((await jobs.done(baseline.job_id as JobId)).status).toBe('completed')
+    const hostSource = 'return { inject: ["autodata"], apply() {} }'
+    const formal = await submitFormalCandidate(evolution, data, 'candidate-replay', hostSource)
+    const recordEvaluation = evolution.recordEvaluation.bind(evolution)
+    Object.defineProperty(evolution, 'recordEvaluation', {
+      configurable: true,
+      value: async (...args: Parameters<EvolutionController['recordEvaluation']>) => {
+        await recordEvaluation(...args)
+        throw new Error('simulated crash after H1 decision commit')
+      },
+    })
+    const agent = { id: 'experiment-agent' } as EvolutionRuntimeAgent
+    const started = controller.start({
+      profile_id: 'bfcl-v4',
+      run_id: 'candidate-replay-run',
+      data_run: formal.dataRun,
+      subject: formal.subject,
+    }, agent)
+    expect((await jobs.done(started.job_id as JobId)).status).toBe('failed')
+    expect(controller.status('bfcl-v4', 'candidate-replay-run').state).toMatchObject({
+      status: 'recovery_required', phase: 'registering',
+    })
+
+    Object.defineProperty(evolution, 'recordEvaluation', { configurable: true, value: recordEvaluation })
+    const resumed = controller.resume('bfcl-v4', 'candidate-replay-run', agent)
+    expect((await jobs.done(resumed.job_id as JobId)).status).toBe('completed')
+    expect(controller.status('bfcl-v4', 'candidate-replay-run').state.decision)
+      .toMatchObject({ candidate_id: 'candidate-replay', accepted: false, reason: 'not_strictly_better' })
+    await controller.dispose()
+  })
+
+  it('replays an accepted H1 against the frozen H0 baseline after the active candidate changed', async () => {
+    const backend = new Backend()
+    const { controller, jobs, evolution, data, runtime } = await fixture(backend)
+    const baseline = controller.start({ profile_id: 'bfcl-v4', run_id: 'baseline-for-accepted-replay', data_run: data })
+    expect((await jobs.done(baseline.job_id as JobId)).status).toBe('completed')
+    const hostSource = 'return { inject: ["autodata"], apply() {} }'
+    const formal = await submitFormalCandidate(evolution, data, 'candidate-accepted-replay', hostSource)
+    const recordEvaluation = evolution.recordEvaluation.bind(evolution)
+    Object.defineProperty(evolution, 'recordEvaluation', {
+      configurable: true,
+      value: async (...args: Parameters<EvolutionController['recordEvaluation']>) => {
+        await recordEvaluation(...args)
+        throw new Error('simulated crash after accepted H1 decision commit')
+      },
+    })
+    backend.evalScore = 1
+    const agent = { id: 'experiment-agent' } as EvolutionRuntimeAgent
+    const started = controller.start({
+      profile_id: 'bfcl-v4',
+      run_id: 'candidate-accepted-replay-run',
+      data_run: formal.dataRun,
+      subject: formal.subject,
+    }, agent)
+    expect((await jobs.done(started.job_id as JobId)).status).toBe('failed')
+    expect(controller.status('bfcl-v4', 'candidate-accepted-replay-run').state).toMatchObject({
+      status: 'recovery_required', phase: 'registering',
+    })
+    expect(evolution.status('bfcl-v4').state).toMatchObject({
+      active_candidate_id: 'candidate-accepted-replay',
+      active_evaluation: { candidate_id: 'candidate-accepted-replay', score: 1 },
+    })
+
+    Object.defineProperty(evolution, 'recordEvaluation', { configurable: true, value: recordEvaluation })
+    const resumed = controller.resume('bfcl-v4', 'candidate-accepted-replay-run', agent)
+    expect((await jobs.done(resumed.job_id as JobId)).status).toBe('completed')
+    const state = controller.status('bfcl-v4', 'candidate-accepted-replay-run').state
+    expect(state.decision).toMatchObject({
+      candidate_id: 'candidate-accepted-replay',
+      accepted: true,
+      reason: 'accepted_strict_improvement',
+      candidate_score: 1,
+      baseline_score: 0.8,
+    })
+    expect(JSON.parse(readFileSync(resolve(state.run_directory, 'evaluation-report.json'), 'utf8')))
+      .toMatchObject({ baseline_candidate_id: 'h0', baseline_score: 0.8 })
+    expect(runtime.activated).toEqual(['candidate-accepted-replay'])
     await controller.dispose()
   })
 
@@ -635,6 +1012,50 @@ describe('Stage 4B ExperimentController', () => {
       await controller.dispose()
     },
   )
+
+  it('revalidates durable predictions before registration recovery and completed replay', async () => {
+    const { controller, jobs, evolution, data } = await fixture()
+    const registerBaseline = evolution.registerBaseline.bind(evolution)
+    Object.defineProperty(evolution, 'registerBaseline', {
+      configurable: true,
+      value: () => { throw new Error('pause after evaluation collection') },
+    })
+    const started = controller.start({
+      profile_id: 'bfcl-v4',
+      run_id: 'predictions-recovery-integrity',
+      data_run: data,
+    })
+    expect((await jobs.done(started.job_id as JobId)).status).toBe('failed')
+    const interrupted = controller.status('bfcl-v4', 'predictions-recovery-integrity').state
+    const predictionsPath = resolve(dirname(interrupted.eval_result_path as string), 'predictions.jsonl')
+    writeFileSync(predictionsPath, '{}\n')
+    Object.defineProperty(evolution, 'registerBaseline', { configurable: true, value: registerBaseline })
+
+    const resumed = controller.resume('bfcl-v4', 'predictions-recovery-integrity')
+    expect((await jobs.done(resumed.job_id as JobId)).status).toBe('failed')
+    expect(controller.status('bfcl-v4', 'predictions-recovery-integrity').state).toMatchObject({
+      status: 'recovery_required',
+      phase: 'registering',
+      failure: { code: 'BASELINE_REGISTRATION_FAILED' },
+    })
+    await controller.dispose()
+  })
+
+  it('rejects a completed ledger whose durable predictions were changed', async () => {
+    const { controller, jobs, data } = await fixture()
+    const started = controller.start({
+      profile_id: 'bfcl-v4',
+      run_id: 'completed-predictions-integrity',
+      data_run: data,
+    })
+    expect((await jobs.done(started.job_id as JobId)).status).toBe('completed')
+    const state = controller.status('bfcl-v4', 'completed-predictions-integrity').state
+    writeFileSync(resolve(dirname(state.eval_result_path as string), 'predictions.jsonl'), '{}\n')
+
+    expect(() => controller.status('bfcl-v4', 'completed-predictions-integrity'))
+      .toThrowError(/predictions JSONL must contain exactly/iu)
+    await controller.dispose()
+  })
 
   it('does not classify a remote failure with a worker failure result as infrastructure', async () => {
     const backend = new Backend()

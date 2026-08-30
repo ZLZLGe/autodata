@@ -4,6 +4,7 @@ import DynamicCordisRunnerService from '@deepseek-ai/dsh-cordis-host-runner'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import AutoDataService from '../service.js'
+import { restrictedDataPluginHostSource } from './candidate-sandbox.js'
 import { runEvolutionFixture } from './fixture.js'
 import { MemoryEvolutionStore } from './store.js'
 import { MAX_HOST_SOURCE_BYTES } from './types.js'
@@ -78,7 +79,7 @@ async function main(): Promise<void> {
       plugin: { kind: 'new', idPrefix: 'aval' },
       name: input.candidate_id,
       purpose: `Validation for ${input.profile_id}`,
-      code: { host: input.host_source },
+      code: { host: restrictedDataPluginHostSource(input.host_source) },
     })
     pluginId = receipt.pluginId
     if (!receipt.hasHostHalf || receipt.hasClientHalf) throw new Error('candidate must be host-only')

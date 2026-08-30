@@ -1,16 +1,22 @@
 import { describe, expect, it } from 'vitest'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
+  CANDIDATE_MANIFEST_SCHEMA_VERSION,
   EVALUATION_REPORT_SCHEMA_VERSION,
   EVOLUTION_FEEDBACK_SCHEMA_VERSION,
   CandidateActivationError,
   EvolutionController,
   EvolutionError,
+  FileEvolutionStore,
   MemoryEvolutionStore,
   type CandidatePackage,
   type CandidateValidationResult,
   type CandidateValidator,
   type EvolutionRuntime,
   type EvolutionRuntimeAgent,
+  type EvolutionStore,
   type RuntimeActivation,
   type TaskProfile,
 } from '../src/evolution/index.js'
@@ -93,6 +99,30 @@ class FailEvaluationCommitStore extends MemoryEvolutionStore {
   }
 }
 
+class FailCandidateCommitStore extends MemoryEvolutionStore {
+  failNextCandidateCommit = false
+
+  override saveState(state: Parameters<MemoryEvolutionStore['saveState']>[0]): void {
+    if (this.failNextCandidateCommit && state.open_candidate_id !== null) {
+      this.failNextCandidateCommit = false
+      throw new EvolutionError('simulated candidate state commit failure', 'STORE_IO')
+    }
+    super.saveState(state)
+  }
+}
+
+class FailFeedbackCommitStore extends MemoryEvolutionStore {
+  failNextFeedbackCommit = false
+
+  override saveState(state: Parameters<MemoryEvolutionStore['saveState']>[0]): void {
+    if (this.failNextFeedbackCommit && state.feedback_ids.length > 0) {
+      this.failNextFeedbackCommit = false
+      throw new EvolutionError('simulated feedback state commit failure', 'STORE_IO')
+    }
+    super.saveState(state)
+  }
+}
+
 function deferred() {
   let resolve!: () => void
   const promise = new Promise<void>((done) => { resolve = done })
@@ -101,7 +131,7 @@ function deferred() {
 
 function setupController<T extends CandidateValidator>(
   validator: T,
-  store = new MemoryEvolutionStore(),
+  store: EvolutionStore = new MemoryEvolutionStore(),
   runtime = new FakeRuntime(),
   registerBaseline = true,
 ) {
@@ -120,7 +150,7 @@ function setupController<T extends CandidateValidator>(
   return { controller, runtime, validator }
 }
 
-function createController(ok = true, store = new MemoryEvolutionStore(), registerBaseline = true) {
+function createController(ok = true, store: EvolutionStore = new MemoryEvolutionStore(), registerBaseline = true) {
   return setupController(new FixedValidator(ok), store, new FakeRuntime(), registerBaseline)
 }
 
@@ -239,6 +269,40 @@ describe('EvolutionController', () => {
     expect(controller.feedback('bfcl', 'feedback-h0')).toEqual(feedback)
   })
 
+  it('idempotently attaches an identical orphan feedback after a state-write crash', () => {
+    const store = new FailFeedbackCommitStore()
+    const { controller } = createController(true, store)
+    const feedback = {
+      schema_version: EVOLUTION_FEEDBACK_SCHEMA_VERSION,
+      feedback_id: 'feedback-orphan',
+      profile_id: 'bfcl',
+      candidate_id: 'h0',
+      benchmark: 'bfcl-v3',
+      split: 'B_search' as const,
+      summary: 'Durable feedback awaiting its state reference.',
+      failures: [{ case_id: 'case-one', summary: 'Wrong selection.' }],
+    }
+    store.failNextFeedbackCommit = true
+
+    expect(() => controller.recordFeedback(feedback)).toThrow(/feedback state commit failure/iu)
+    expect(store.getFeedback('bfcl', feedback.feedback_id)).toEqual(feedback)
+    expect(controller.status('bfcl').state).toMatchObject({
+      feedback_ids: [],
+      current_feedback_id: null,
+    })
+    expect(() => controller.recordFeedback({ ...feedback, summary: 'conflicting replay' }))
+      .toThrowError(expect.objectContaining({ code: 'FEEDBACK_EXISTS' }))
+
+    expect(controller.recordFeedback(feedback)).toEqual(feedback)
+    expect(controller.status('bfcl').state).toMatchObject({
+      feedback_ids: [feedback.feedback_id],
+      current_feedback_id: feedback.feedback_id,
+    })
+    expect(controller.feedback('bfcl')).toEqual(feedback)
+    expect(controller.recordFeedback(feedback)).toEqual(feedback)
+    expect(controller.status('bfcl').state.feedback_ids).toEqual([feedback.feedback_id])
+  })
+
   it('submits, validates, strictly accepts, rejects a tie, and rolls back H0', async () => {
     const { controller, runtime } = createController()
     const proposed = submit(controller, 'candidate-one', '1')
@@ -270,6 +334,20 @@ describe('EvolutionController', () => {
     expect(runtime.ensured).toEqual([null])
   })
 
+  it('idempotently abandons an unevaluated open candidate', async () => {
+    const { controller } = createController()
+    submit(controller, 'candidate-abandoned', '1')
+    await controller.validateCandidate('bfcl', 'candidate-abandoned')
+
+    const abandoned = controller.abandonCandidate('bfcl', 'candidate-abandoned')
+    expect(abandoned.state).toMatchObject({ active_candidate_id: 'h0', open_candidate_id: null })
+    expect(abandoned.state.candidates).toContainEqual(expect.objectContaining({
+      candidate_id: 'candidate-abandoned',
+      status: 'rejected',
+    }))
+    expect(controller.abandonCandidate('bfcl', 'candidate-abandoned').state).toEqual(abandoned.state)
+  })
+
   it('submits and validates in one call while closing a technical failure', async () => {
     const accepted = createController(true)
     const ok = await accepted.controller.submitAndValidateCandidate('bfcl', {
@@ -284,6 +362,68 @@ describe('EvolutionController', () => {
     })
     expect(failed.validation).toMatchObject({ ok: false, reason: 'fixture rejected the candidate' })
     expect(failed.status.state).toMatchObject({ active_candidate_id: 'h0', open_candidate_id: null })
+  })
+
+  it('idempotently commits an identical orphan candidate after a state-write crash', () => {
+    const store = new FailCandidateCommitStore()
+    const { controller } = createController(true, store)
+    store.failNextCandidateCommit = true
+
+    expect(() => submit(controller, 'candidate-orphan', '1')).toThrow(/state commit failure/iu)
+    expect(store.getCandidate('bfcl', 'candidate-orphan')).toBeDefined()
+    expect(controller.status('bfcl').state.candidates).not.toContainEqual(expect.objectContaining({
+      candidate_id: 'candidate-orphan',
+    }))
+
+    expect(() => submit(controller, 'candidate-orphan', '2')).toThrow(/different content/iu)
+    expect(() => controller.submitCandidate('bfcl', {
+      candidate_id: 'candidate-orphan',
+      strategy_version: '1',
+      host_source: `${hostSource}\n`,
+    })).toThrow(/different content/iu)
+
+    const recovered = submit(controller, 'candidate-orphan', '1')
+    expect(recovered.state.open_candidate_id).toBe('candidate-orphan')
+    expect(recovered.state.candidates).toContainEqual(expect.objectContaining({
+      candidate_id: 'candidate-orphan', status: 'proposed',
+    }))
+    expect(() => submit(controller, 'candidate-orphan', '1')).toThrow(/already/iu)
+  })
+
+  it('recovers an identical orphan candidate from a File Store without rewriting it', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'autodata-candidate-replay-'))
+    try {
+      const store = new FileEvolutionStore(directory)
+      const { controller } = createController(true, store)
+      const profile = controller.status('bfcl').profile
+      const orphan: CandidatePackage = {
+        manifest: {
+          schema_version: CANDIDATE_MANIFEST_SCHEMA_VERSION,
+          candidate_id: 'candidate-orphan',
+          profile_id: profile.id,
+          generation: 1,
+          parent_candidate_id: 'h0',
+          strategy_version: '1',
+          capabilities: profile.capabilities,
+        },
+        host_source: hostSource,
+      }
+      store.saveCandidate(orphan)
+
+      const restarted = new EvolutionController({
+        store: new FileEvolutionStore(directory),
+        validator: new FixedValidator(true),
+        runtime: new FakeRuntime(),
+      })
+      expect(() => submit(restarted, 'candidate-orphan', '2')).toThrow(/different content/iu)
+      const recovered = submit(restarted, 'candidate-orphan', '1')
+
+      expect(recovered.state.open_candidate_id).toBe('candidate-orphan')
+      expect(new FileEvolutionStore(directory).loadConsistentSnapshot('bfcl').candidate_packages)
+        .toEqual([orphan])
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
   })
 
   it('keeps a proposal open when validation infrastructure is unavailable', async () => {
@@ -494,6 +634,69 @@ describe('EvolutionController', () => {
     const repeated = await controller.recordEvaluation(evaluation, agent)
     expect(repeated.decision).toEqual(replayed.decision)
     expect(runtime.activated).toEqual(['candidate-one', 'candidate-one'])
+  })
+
+  it('restores a durable accepted candidate when its evaluation is replayed in a fresh process', async () => {
+    const store = new MemoryEvolutionStore()
+    const { controller } = createController(true, store)
+    submit(controller, 'candidate-one', '1')
+    await controller.validateCandidate('bfcl', 'candidate-one')
+    const evaluation = report('candidate-one', 'h0', 0.5, 0.6)
+    await controller.recordEvaluation(evaluation, agent)
+
+    const runtime = new FakeRuntime()
+    const restarted = new EvolutionController({ store, validator: new FixedValidator(true), runtime })
+    const replayed = await restarted.recordEvaluation(evaluation, agent)
+
+    expect(replayed.decision).toMatchObject({ accepted: true })
+    expect(replayed.status.state.active_candidate_id).toBe('candidate-one')
+    expect(runtime.ensured).toEqual(['candidate-one'])
+  })
+
+  it('restores H0 after a rejected H1 evaluation is replayed in a fresh process', async () => {
+    const store = new MemoryEvolutionStore()
+    const { controller } = createController(true, store)
+    submit(controller, 'candidate-one', '1')
+    await controller.validateCandidate('bfcl', 'candidate-one')
+    const evaluation = report('candidate-one', 'h0', 0.5, 0.5)
+    await controller.recordEvaluation(evaluation, agent)
+
+    const runtime = new FakeRuntime()
+    const restarted = new EvolutionController({ store, validator: new FixedValidator(true), runtime })
+    const replayed = await restarted.recordEvaluation(evaluation, agent)
+
+    expect(replayed.decision).toMatchObject({ accepted: false, reason: 'not_strictly_better' })
+    expect(replayed.status.state.active_candidate_id).toBe('h0')
+    expect(runtime.ensured).toEqual([null])
+  })
+
+  it('restores the durable parent after a rejected evaluation is replayed or resumed in a fresh process', async () => {
+    const store = new MemoryEvolutionStore()
+    const { controller } = createController(true, store)
+    submit(controller, 'candidate-one', '1')
+    await controller.validateCandidate('bfcl', 'candidate-one')
+    await controller.recordEvaluation(report('candidate-one', 'h0', 0.5, 0.6), agent)
+    submit(controller, 'candidate-two', '2')
+    await controller.validateCandidate('bfcl', 'candidate-two')
+    const evaluation = report('candidate-two', 'candidate-one', 0.6, 0.6)
+    await controller.recordEvaluation(evaluation, agent)
+
+    const replayRuntime = new FakeRuntime()
+    const replayedController = new EvolutionController({
+      store, validator: new FixedValidator(true), runtime: replayRuntime,
+    })
+    const replayed = await replayedController.recordEvaluation(evaluation, agent)
+    expect(replayed.decision).toMatchObject({ accepted: false, reason: 'not_strictly_better' })
+    expect(replayed.status.state.active_candidate_id).toBe('candidate-one')
+    expect(replayRuntime.ensured).toEqual(['candidate-one'])
+
+    const resumeRuntime = new FakeRuntime()
+    const resumedController = new EvolutionController({
+      store, validator: new FixedValidator(true), runtime: resumeRuntime,
+    })
+    const resumed = await resumedController.resume('bfcl', agent)
+    expect(resumed.state.active_candidate_id).toBe('candidate-one')
+    expect(resumeRuntime.ensured).toEqual(['candidate-one'])
   })
 
   it.each(['unavailable', 'degraded'] as const)(

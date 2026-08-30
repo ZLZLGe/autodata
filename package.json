@@ -44,6 +44,11 @@
       "import": "./lib/experiment/index.js",
       "default": "./lib/experiment/index.js"
     },
+    "./generation": {
+      "types": "./lib/generation/index.d.ts",
+      "import": "./lib/generation/index.js",
+      "default": "./lib/generation/index.js"
+    },
     "./stage4a": {
       "types": "./lib/stage4a/index.d.ts",
       "import": "./lib/stage4a/index.js",
@@ -77,6 +82,7 @@
     "test:python": "scripts/test-stage4a-python.sh && scripts/test-stage4b-python.sh",
     "test:profile": "pnpm run build && node scripts/profile-smoke.mjs",
     "smoke:freerouter": "pnpm run build && node scripts/freerouter-agent-smoke.mjs",
+    "stage4c:first-h1": "pnpm run build && node scripts/stage4c-first-h1.mjs",
     "pack:check": "npm pack --dry-run",
     "check": "pnpm run typecheck && pnpm run test && pnpm run test:python && pnpm run test:profile && pnpm run pack:check",
     "prepare": "pnpm run build"

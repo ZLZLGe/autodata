@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import copy
 import shutil
 import tempfile
 import types
@@ -76,6 +77,122 @@ class WorkerContractTest(unittest.TestCase):
         self.assertEqual([row["id"] for row in rows[:25]], list(worker.CASE_IDS["B_search"]))
         self.assertEqual([row["id"] for row in rows[25:]], list(worker.CASE_IDS["B_dev"]))
         self.assertEqual(worker._case_category("parallel_multiple_177"), "parallel_multiple")
+
+    def test_candidate_contract_preserves_h0_protocol_and_source_pool(self) -> None:
+        contract = copy.deepcopy(worker._expected_contract())
+        contract["contract_id"] = worker.CANDIDATE_CONTRACT_ID
+        contract["subject"] = {
+            "candidate_id": "candidate-one",
+            "generation": 1,
+            "plugin_id": "bfcl-v4-strategy",
+            "strategy_version": "1",
+            "host_source_sha256": "a" * 64,
+        }
+        contract["data"]["harness_id"] = "bfcl-v4-strategy-h1"
+        contract["data"]["logical_training_units"] = 2
+        contract["data"]["logical_view_jsonl_sha256"] = "b" * 64
+        contract["data"]["run_summary_json_sha256"] = "c" * 64
+        worker._validate_contract(contract)
+
+        contract["data"]["canonical_jsonl_sha256"] = "d" * 64
+        with self.assertRaisesRegex(ValueError, "source pool"):
+            worker._validate_contract(contract)
+
+    def test_candidate_logical_view_can_filter_and_reorder_with_frozen_provenance(self) -> None:
+        contract = copy.deepcopy(worker._expected_contract())
+        contract["contract_id"] = worker.CANDIDATE_CONTRACT_ID
+        contract["subject"] = {
+            "candidate_id": "candidate-one",
+            "generation": 1,
+            "plugin_id": "bfcl-v4-strategy",
+            "strategy_version": "1",
+            "host_source_sha256": "a" * 64,
+        }
+        contract["data"]["canonical_records"] = 3
+        contract["data"]["logical_training_units"] = 2
+        source = worker._expected_source(contract)
+        canonical = [
+            {
+                "schema_version": worker.CANONICAL_VERSION,
+                "source": {**source, "record_id": f"record-{index}", "record_index": index, "record_line": index + 1},
+                "messages": [
+                    {"role": "user", "content": f"question {index}"},
+                    {"role": "assistant", "content": f"answer {index}"},
+                ],
+                "tools": [],
+            }
+            for index in range(3)
+        ]
+        logical = [
+            {
+                "schema_version": worker.LOGICAL_VERSION,
+                "id": f"record-{record_index}:assistant:1",
+                "source": canonical[record_index]["source"],
+                "assistant_message_index": 1,
+                "messages": [
+                    canonical[record_index]["messages"][0],
+                    {**canonical[record_index]["messages"][1], "loss": True},
+                ],
+                "tools": [],
+                "selection_rank": rank,
+                "plugin_provenance": [{
+                    "plugin_id": "bfcl-v4-strategy",
+                    "plugin_version": "1",
+                    "note": f"rank-{rank}",
+                }],
+            }
+            for rank, record_index in enumerate((2, 0))
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            canonical_path = root / "canonical.jsonl"
+            logical_path = root / "logical-view.jsonl"
+            summary_path = root / "run-summary.json"
+            canonical_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in canonical), encoding="utf-8"
+            )
+            logical_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in logical), encoding="utf-8"
+            )
+            summary = {
+                "summary_version": worker.RUN_SUMMARY_VERSION,
+                "harness_id": contract["data"]["harness_id"],
+                "generation": 1,
+                "seed": contract["data"]["seed"],
+                "canonical_schema_version": worker.CANONICAL_VERSION,
+                "logical_view_schema_version": worker.LOGICAL_VERSION,
+                "source": source,
+                "plugins": [{"id": "bfcl-v4-strategy", "version": "1"}],
+                "counts": {
+                    "source_records_read": 3,
+                    "selected_source_records": 2,
+                    "quarantined_source_records": 0,
+                    "duplicate_source_records": 0,
+                    "canonical_records": 3,
+                    "logical_training_units": 2,
+                    "validation_warnings": 0,
+                },
+                "validation_warning_counts": {},
+            }
+            write_json(summary_path, summary)
+            contract["data"].update({
+                "canonical_jsonl_sha256": hashlib.sha256(canonical_path.read_bytes()).hexdigest(),
+                "logical_view_jsonl_sha256": hashlib.sha256(logical_path.read_bytes()).hexdigest(),
+                "run_summary_json_sha256": hashlib.sha256(summary_path.read_bytes()).hexdigest(),
+            })
+            request = {"input": {
+                "canonical_jsonl": str(canonical_path),
+                "logical_view_jsonl": str(logical_path),
+                "run_summary_json": str(summary_path),
+            }}
+            rows = worker._validate_materialized_data(request, root, contract)
+            self.assertEqual([row["id"] for row in rows], ["record-2:assistant:1", "record-0:assistant:1"])
+
+            summary["counts"]["selected_source_records"] = 3
+            write_json(summary_path, summary)
+            contract["data"]["run_summary_json_sha256"] = hashlib.sha256(summary_path.read_bytes()).hexdigest()
+            with self.assertRaisesRegex(ValueError, "record counts"):
+                worker._validate_materialized_data(request, root, contract)
 
     def test_eval_request_uses_raw_contract_hash_and_rejects_extras(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

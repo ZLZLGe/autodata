@@ -13,6 +13,7 @@ import {
   EXPERIMENT_TRAIN_REQUEST_VERSION,
   EXPERIMENT_TRAIN_RESULT_VERSION,
   ExperimentError,
+  type ExperimentCandidateSubject,
   type ExperimentContract,
   type ExperimentEvalCaseResult,
   type ExperimentEvalRequest,
@@ -28,6 +29,7 @@ const ID_PATTERN = /^[a-z][a-z0-9-]*$/u
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u
 const MAX_ID_LENGTH = 48
 const STAGE4B_CONTRACT_ID = 'stage4b-h0-baseline-1'
+export const STAGE4C_CANDIDATE_CONTRACT_ID = 'stage4c-candidate-1'
 const STAGE4B_DATASET_ID = 'nex-agi/agent-sft'
 const STAGE4B_DATASET_SUBSET = 'tool_calling'
 const STAGE4B_DATASET_REVISION = 'd8d4de5643f9fe9d3fc3f89b3d55b8709ddc35c9'
@@ -129,8 +131,9 @@ export function validateExperimentId(value: unknown, label: string): string {
 
 export function normalizeExperimentStartRequest(input: unknown): ExperimentStartRequest {
   if (!isJsonObject(input)) requestInvalid('experiment start request must be an object')
-  const allowed = ['profile_id', 'run_id', 'data_run'] as const
-  const missing = allowed.find(field => !Object.hasOwn(input, field))
+  const required = ['profile_id', 'run_id', 'data_run'] as const
+  const allowed = [...required, 'subject'] as const
+  const missing = required.find(field => !Object.hasOwn(input, field))
   if (missing !== undefined) requestInvalid(`experiment start request is missing field ${missing}`)
   const extra = Object.keys(input).find(field => !allowed.includes(field as typeof allowed[number]))
   if (extra !== undefined) requestInvalid(`experiment start request has unsupported field ${extra}`)
@@ -138,6 +141,64 @@ export function normalizeExperimentStartRequest(input: unknown): ExperimentStart
     profile_id: validateExperimentId(input.profile_id, 'profile_id'),
     run_id: validateExperimentId(input.run_id, 'run_id'),
     data_run: input.data_run as unknown as DataRunResult,
+    ...(input.subject === undefined ? {} : {
+      subject: normalizeCandidateSubject(input.subject, 'experiment start request.subject', requestInvalid),
+    }),
+  })
+}
+
+function normalizeCandidateSubject(
+  input: unknown,
+  label: string,
+  fail: (message: string) => never = invalid,
+): ExperimentCandidateSubject {
+  if (!isJsonObject(input)) fail(`${label} must be an object`)
+  const value = input as Record<string, unknown>
+  const fields = [
+    'candidate_id', 'generation', 'plugin_id', 'strategy_version', 'host_source_sha256',
+    'runtime_plan_sha256', 'materialization_sha256',
+  ] as const
+  const missing = fields.find(field => !Object.hasOwn(value, field))
+  if (missing !== undefined) fail(`${label} is missing field ${missing}`)
+  const extra = Object.keys(value).find(field => !fields.includes(field as typeof fields[number]))
+  if (extra !== undefined) fail(`${label} has unsupported field ${extra}`)
+  const candidateId = value.candidate_id
+  const pluginId = value.plugin_id
+  if (typeof candidateId !== 'string' || candidateId.length > MAX_ID_LENGTH || !ID_PATTERN.test(candidateId)) {
+    fail(`${label}.candidate_id must be a valid experiment identifier`)
+  }
+  if (candidateId === 'h0') fail(`${label}.candidate_id must identify an evolved candidate`)
+  if (typeof pluginId !== 'string' || pluginId.length > MAX_ID_LENGTH || !ID_PATTERN.test(pluginId)) {
+    fail(`${label}.plugin_id must be a valid experiment identifier`)
+  }
+  const generation = value.generation
+  if (typeof generation !== 'number' || !Number.isSafeInteger(generation) || generation !== 1) {
+    fail(`${label}.generation must equal 1 for the first evolved candidate`)
+  }
+  const strategyVersion = value.strategy_version
+  if (typeof strategyVersion !== 'string' || strategyVersion.length === 0 || strategyVersion.length > 128) {
+    fail(`${label}.strategy_version must be a non-empty string no longer than 128 characters`)
+  }
+  const hostSourceSha256 = value.host_source_sha256
+  if (typeof hostSourceSha256 !== 'string' || !SHA256_PATTERN.test(hostSourceSha256)) {
+    fail(`${label}.host_source_sha256 must be lowercase SHA-256`)
+  }
+  const runtimePlanSha256 = value.runtime_plan_sha256
+  if (typeof runtimePlanSha256 !== 'string' || !SHA256_PATTERN.test(runtimePlanSha256)) {
+    fail(`${label}.runtime_plan_sha256 must be lowercase SHA-256`)
+  }
+  const materializationSha256 = value.materialization_sha256
+  if (typeof materializationSha256 !== 'string' || !SHA256_PATTERN.test(materializationSha256)) {
+    fail(`${label}.materialization_sha256 must be lowercase SHA-256`)
+  }
+  return Object.freeze({
+    candidate_id: candidateId,
+    generation,
+    plugin_id: pluginId,
+    strategy_version: strategyVersion,
+    host_source_sha256: hostSourceSha256,
+    runtime_plan_sha256: runtimePlanSha256,
+    materialization_sha256: materializationSha256,
   })
 }
 
@@ -166,7 +227,7 @@ function normalizeCaseIds(value: unknown, categories: readonly string[], perCate
   return Object.freeze(result)
 }
 
-/** Load and strictly freeze the checked-in Stage 4B contract. */
+/** Load and strictly freeze either the checked-in H0 contract or one derived H1 contract. */
 export function loadExperimentContract(pathInput: string): {
   readonly contract: ExperimentContract
   readonly sha256: string
@@ -186,12 +247,20 @@ export function loadExperimentContract(pathInput: string): {
 
 export function normalizeExperimentContract(input: unknown): ExperimentContract {
   const value = record(input, 'experiment contract')
+  const hasSubject = Object.hasOwn(value, 'subject')
   exact(value, [
     'schema_version', 'contract_id', 'profile', 'data', 'model', 'execution',
-    'training', 'evaluation', 'retry',
+    'training', 'evaluation', 'retry', ...(hasSubject ? ['subject'] : []),
   ], 'experiment contract')
   literal(value.schema_version, EXPERIMENT_CONTRACT_VERSION, 'experiment contract.schema_version')
-  literal(value.contract_id, STAGE4B_CONTRACT_ID, 'experiment contract.contract_id')
+  literal(
+    value.contract_id,
+    hasSubject ? STAGE4C_CANDIDATE_CONTRACT_ID : STAGE4B_CONTRACT_ID,
+    'experiment contract.contract_id',
+  )
+  const subject = hasSubject
+    ? normalizeCandidateSubject(value.subject, 'experiment contract.subject')
+    : undefined
 
   const profile = record(value.profile, 'experiment contract.profile')
   exact(profile, ['id', 'benchmark', 'metric'], 'experiment contract.profile')
@@ -208,10 +277,14 @@ export function normalizeExperimentContract(input: unknown): ExperimentContract 
   literal(data.dataset_id, STAGE4B_DATASET_ID, 'experiment contract.data.dataset_id')
   literal(data.dataset_subset, STAGE4B_DATASET_SUBSET, 'experiment contract.data.dataset_subset')
   literal(data.dataset_revision, STAGE4B_DATASET_REVISION, 'experiment contract.data.dataset_revision')
-  literal(data.harness_id, 'toolcall-h0', 'experiment contract.data.harness_id')
+  const harnessId = subject === undefined
+    ? literal(data.harness_id, 'toolcall-h0', 'experiment contract.data.harness_id')
+    : text(data.harness_id, 'experiment contract.data.harness_id')
   literal(data.seed, 42, 'experiment contract.data.seed')
   literal(data.canonical_records, 100, 'experiment contract.data.canonical_records')
-  literal(data.logical_training_units, 236, 'experiment contract.data.logical_training_units')
+  const logicalTrainingUnits = subject === undefined
+    ? literal(data.logical_training_units, 236, 'experiment contract.data.logical_training_units')
+    : integer(data.logical_training_units, 'experiment contract.data.logical_training_units', 1)
   literal(data.historical_training_tokens, 508_114, 'experiment contract.data.historical_training_tokens')
   for (const field of ['canonical_jsonl_sha256', 'logical_view_jsonl_sha256', 'run_summary_json_sha256'] as const) {
     if (!SHA256_PATTERN.test(text(data[field], `experiment contract.data.${field}`))) invalid(`${field} must be lowercase SHA-256`)
@@ -363,16 +436,17 @@ export function normalizeExperimentContract(input: unknown): ExperimentContract 
 
   return immutableJson({
     schema_version: EXPERIMENT_CONTRACT_VERSION,
-    contract_id: STAGE4B_CONTRACT_ID,
+    contract_id: subject === undefined ? STAGE4B_CONTRACT_ID : STAGE4C_CANDIDATE_CONTRACT_ID,
+    ...(subject === undefined ? {} : { subject }),
     profile: { id: 'bfcl-v4', benchmark, metric },
     data: {
       dataset_id: STAGE4B_DATASET_ID,
       dataset_subset: STAGE4B_DATASET_SUBSET,
       dataset_revision: STAGE4B_DATASET_REVISION,
-      harness_id: 'toolcall-h0',
+      harness_id: harnessId,
       seed: 42,
       canonical_records: 100,
-      logical_training_units: 236,
+      logical_training_units: logicalTrainingUnits,
       historical_training_tokens: 508_114,
       canonical_jsonl_sha256: data.canonical_jsonl_sha256,
       logical_view_jsonl_sha256: data.logical_view_jsonl_sha256,
@@ -469,6 +543,32 @@ export function normalizeExperimentContract(input: unknown): ExperimentContract 
     },
     retry: { scientific_retries: 0, infrastructure_retries_per_stage: 1 },
   }) as unknown as ExperimentContract
+}
+
+/** Derive the immutable H1 run contract from the frozen H0 protocol and materialized view. */
+export function createCandidateExperimentContract(input: {
+  readonly baseline: ExperimentContract
+  readonly subject: ExperimentCandidateSubject
+  readonly data_run: DataRunResult
+  readonly artifact_hashes: Readonly<Record<'canonical.jsonl' | 'logical-view.jsonl' | 'run-summary.json', string>>
+}): ExperimentContract {
+  if (input.baseline.subject !== undefined || input.baseline.contract_id !== STAGE4B_CONTRACT_ID) {
+    invalid('candidate experiment must derive from the frozen H0 contract')
+  }
+  return normalizeExperimentContract({
+    ...input.baseline,
+    contract_id: STAGE4C_CANDIDATE_CONTRACT_ID,
+    subject: input.subject,
+    data: {
+      ...input.baseline.data,
+      harness_id: input.data_run.summary.harness_id,
+      canonical_records: input.data_run.canonical_records.length,
+      logical_training_units: input.data_run.logical_training_view.length,
+      canonical_jsonl_sha256: input.artifact_hashes['canonical.jsonl'],
+      logical_view_jsonl_sha256: input.artifact_hashes['logical-view.jsonl'],
+      run_summary_json_sha256: input.artifact_hashes['run-summary.json'],
+    },
+  })
 }
 
 export function validateExperimentMaterializedData(value: unknown): ExperimentMaterializedData {

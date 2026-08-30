@@ -5,6 +5,7 @@ export {
   DEFAULT_TASK_PROFILE,
   getEvolutionController,
   getExperimentController,
+  getGenerationController,
   getStage4AController,
   startStage4A,
   statusStage4A,
@@ -52,5 +53,6 @@ export {
 export type * from './core/types.js'
 export * from './evolution/index.js'
 export * from './experiment/index.js'
+export * from './generation/index.js'
 export * from './stage4a/index.js'
 export { default } from './service.js'

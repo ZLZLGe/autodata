@@ -3,6 +3,8 @@
 import type { JobId, JobOutcome } from '@deepseek-ai/dsh-jobs'
 import type { DataRunResult, JsonObject } from '../core/types.js'
 import type { EvolutionController } from '../evolution/controller.js'
+import type { EvolutionRuntimeAgent } from '../evolution/runtime.js'
+import type { AcceptanceDecision } from '../evolution/types.js'
 import type {
   Stage4ACommandResult,
   Stage4ARJobBackend,
@@ -23,6 +25,8 @@ export type ExperimentStage = typeof EXPERIMENT_STAGES[number]
 export interface ExperimentContract {
   readonly schema_version: typeof EXPERIMENT_CONTRACT_VERSION
   readonly contract_id: string
+  /** Absent only for the byte-compatible Stage 4B H0 baseline contract. */
+  readonly subject?: ExperimentCandidateSubject
   readonly profile: {
     readonly id: string
     readonly benchmark: string
@@ -151,6 +155,17 @@ export interface ExperimentContract {
   }
 }
 
+/** Frozen identity of the validated strategy whose materialized view is trained. */
+export interface ExperimentCandidateSubject {
+  readonly candidate_id: string
+  readonly generation: number
+  readonly plugin_id: string
+  readonly strategy_version: string
+  readonly host_source_sha256: string
+  readonly runtime_plan_sha256: string
+  readonly materialization_sha256: string
+}
+
 export interface ExperimentWheelhouse {
   readonly path: string
   readonly manifest_sha256: string
@@ -160,6 +175,8 @@ export interface ExperimentStartRequest {
   readonly profile_id: string
   readonly run_id: string
   readonly data_run: DataRunResult
+  /** Omit for H0. H1 is cross-checked against the durable Evolution Store. */
+  readonly subject?: ExperimentCandidateSubject
 }
 
 export interface ExperimentMaterializedData {
@@ -332,10 +349,14 @@ export interface ExperimentState {
   readonly created_at: string
   readonly updated_at: string
   readonly attempts: readonly ExperimentAttempt[]
+  readonly candidate_id?: string
+  readonly candidate_generation?: number
   readonly train_result_path?: string
   readonly eval_result_path?: string
   readonly feedback_id?: string
   readonly evaluation_report_id?: string
+  readonly decision_path?: string
+  readonly decision?: AcceptanceDecision
   readonly failure?: ExperimentFailure
 }
 
@@ -376,6 +397,9 @@ export interface ExperimentControllerOptions {
   readonly sleep?: (milliseconds: number, signal: AbortSignal) => Promise<void>
 }
 
+/** Process-local runtime authority required only when an H1 might be accepted. */
+export type ExperimentRuntimeAgent = EvolutionRuntimeAgent
+
 export type ExperimentErrorCode =
   | 'INVALID_REQUEST'
   | 'RUN_EXISTS'
@@ -394,6 +418,7 @@ export type ExperimentErrorCode =
   | 'CANCEL_FAILED'
   | 'STORE_IO'
   | 'BASELINE_REGISTRATION_FAILED'
+  | 'EVALUATION_REGISTRATION_FAILED'
 
 export class ExperimentError extends Error {
   readonly code: ExperimentErrorCode

@@ -2,7 +2,9 @@ import { Context, type Fiber } from '@deepseek-ai/cordis'
 import DynamicCordisRunnerService from '@deepseek-ai/dsh-cordis-host-runner'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
+import { createHash } from 'node:crypto'
 import { afterEach, describe, expect, it } from 'vitest'
+import type { JsonObject, SourceAdapter } from '../src/core/types.js'
 import AutoDataService from '../src/service.js'
 import {
   CANDIDATE_MANIFEST_SCHEMA_VERSION,
@@ -10,7 +12,10 @@ import {
   DshEvolutionRuntime,
   MemoryEvolutionStore,
   ProcessCandidateValidator,
+  candidateRuntimeHostSource,
+  createFrozenSelectionRuntimeBinding,
   normalizeTaskProfile,
+  runEvolutionFixture,
   type CandidatePackage,
   type EvolutionRuntimeAgent,
 } from '../src/evolution/index.js'
@@ -83,6 +88,75 @@ function strategySource(version: string): string {
   `
 }
 
+function sha256(value: string): string {
+  return createHash('sha256').update(value).digest('hex')
+}
+
+const productionAdapter: SourceAdapter = Object.freeze({
+  id: 'bound-source-adapter',
+  version: '1',
+  identify(value: unknown) {
+    return typeof value === 'object' && value !== null && typeof (value as { id?: unknown }).id === 'string'
+      ? (value as { id: string }).id
+      : null
+  },
+  adapt(value: unknown) {
+    const record = value as { id: string }
+    return {
+      messages: [
+        { role: 'user' as const, content: `question ${record.id}` },
+        { role: 'assistant' as const, content: `answer ${record.id}` },
+      ],
+      tools: [],
+      warnings: [],
+    }
+  },
+})
+
+function formalCandidate(
+  hostSource: string,
+  runtimeBinding: JsonObject | undefined = undefined,
+): CandidatePackage {
+  const materializationSha256 = 'b'.repeat(64)
+  const sourceSha256 = sha256(hostSource)
+  const binding = runtimeBinding ?? createFrozenSelectionRuntimeBinding({
+    profile_id: 'bfcl',
+    candidate_id: 'candidate-1',
+    generation: 1,
+    parent_candidate_id: 'h0',
+    plugin_id: 'bfcl-strategy',
+    strategy_version: '1',
+    host_source_sha256: sourceSha256,
+    source_pool_sha256: 'a'.repeat(64),
+    materialization_sha256: materializationSha256,
+    harness_id: 'bound-formal-runtime',
+    seed: 42,
+    source: {
+      adapter_id: productionAdapter.id,
+      adapter_version: productionAdapter.version,
+      dataset_id: 'bound-source',
+      dataset_revision: '1',
+    },
+    source_record_ids: ['source-a', 'source-b', 'source-c'],
+    decisions: [
+      { record_id: 'source-c', note: 'highest priority' },
+      { record_id: 'source-a', note: 'fallback' },
+    ],
+  }) as unknown as JsonObject
+  return {
+    ...candidate('1', hostSource),
+    manifest: {
+      ...candidate('1', hostSource).manifest,
+      metadata: {
+        generation_run_id: 'formal-generation-one',
+        source_sha256: sourceSha256,
+        materialization_sha256: materializationSha256,
+        runtime_binding: binding,
+      },
+    },
+  }
+}
+
 afterEach(async () => {
   for (const resource of resources.splice(0).reverse()) {
     try { await resource.runtime.dispose() } catch { /* individual tests assert degraded teardown */ }
@@ -105,6 +179,95 @@ describe('DshEvolutionRuntime', () => {
     expect(ctx.autodata.plugins()).toContainEqual({ id: 'toolcall-h0', version: '3' })
     expect(borrowed.inventory()).toHaveLength(0)
     expect(ctx.get('dynamicCordisRunner', true)).toBeDefined()
+  })
+
+  it('replays frozen formal decisions without executing the raw candidate on the production source pool', async () => {
+    const { ctx, profile, runtime } = await setup()
+    const rawSource = `
+      return {
+        inject: ['autodata'],
+        apply(ctx) {
+          ctx.autodata.register({
+            id: 'bfcl-strategy',
+            version: '1',
+            run(input) {
+              if (input.some(item => item.record.source.record_id === 'source-a')) {
+                throw new Error('raw candidate run executed on the production source pool')
+              }
+              return input.map(item => ({ record_id: item.record.source.record_id }))
+            },
+          })
+        },
+      }
+    `
+    const formal = formalCandidate(rawSource)
+
+    await runtime.activate(profile, null, formal, agent)
+    const run = ctx.autodata.run({
+      harness_id: 'bound-formal-runtime',
+      generation: 1,
+      seed: 42,
+      source: {
+        dataset_id: 'bound-source',
+        dataset_revision: '1',
+        records: [{ id: 'source-a' }, { id: 'source-b' }, { id: 'source-c' }],
+      },
+      source_adapter: productionAdapter,
+      selected_record_ids: null,
+      quarantine_record_ids: [],
+      plugin_ids: ['bfcl-strategy'],
+    })
+
+    expect(run.logical_training_view.map(unit => unit.source.record_id)).toEqual(['source-c', 'source-a'])
+    expect(run.logical_training_view.map(unit => unit.plugin_provenance)).toEqual([
+      [{ plugin_id: 'bfcl-strategy', plugin_version: '1', note: 'highest priority' }],
+      [{ plugin_id: 'bfcl-strategy', plugin_version: '1', note: 'fallback' }],
+    ])
+
+    expect(() => runEvolutionFixture(ctx.autodata, profile.id, 1, profile.strategy_plugin_id))
+      .toThrow(/candidate DataPlugin run failed/iu)
+    const compiled = candidateRuntimeHostSource(profile, formal)
+    expect(compiled).not.toContain('fixture-one')
+    expect(compiled).not.toContain('autodata-evolution-fixture')
+  })
+
+  it('fails closed when a formal runtime binding is malformed', async () => {
+    const { ctx, profile, runtime } = await setup()
+    const rawSource = strategySource('1')
+    const valid = formalCandidate(rawSource)
+    const binding = valid.manifest.metadata?.runtime_binding as JsonObject
+    const malformed = formalCandidate(rawSource, {
+      ...binding,
+      runtime_plan_sha256: '0'.repeat(64),
+    })
+
+    await expect(runtime.activate(profile, null, malformed, agent)).rejects.toMatchObject({
+      code: 'INVALID_CANDIDATE',
+    })
+    expect(ctx.autodata.plugins()).toEqual([{ id: 'toolcall-h0', version: '3' }])
+    expect(ctx.dynamicCordisRunner.inventory()).toHaveLength(0)
+  })
+
+  it('fails closed when formal metadata omits its runtime binding', async () => {
+    const { ctx, profile, runtime } = await setup()
+    const rawSource = strategySource('1')
+    const formalWithoutBinding: CandidatePackage = {
+      ...candidate('1', rawSource),
+      manifest: {
+        ...candidate('1', rawSource).manifest,
+        metadata: {
+          generation_run_id: 'formal-generation-one',
+          source_sha256: sha256(rawSource),
+          materialization_sha256: 'b'.repeat(64),
+        },
+      },
+    }
+
+    await expect(runtime.activate(profile, null, formalWithoutBinding, agent)).rejects.toMatchObject({
+      code: 'INVALID_CANDIDATE',
+    })
+    expect(ctx.autodata.plugins()).toEqual([{ id: 'toolcall-h0', version: '3' }])
+    expect(ctx.dynamicCordisRunner.inventory()).toHaveLength(0)
   })
 
   it('restores the old package when a DSH update fails', async () => {
@@ -178,6 +341,97 @@ describe('DshEvolutionRuntime', () => {
     expect(ctx.tools.get('candidate_side_effect')).toBeUndefined()
     expect(ctx.tools.schemas()).toEqual(baselineSchemas)
     expect(ctx.autodata.plugins()).toEqual([{ id: 'toolcall-h0', version: '3' }])
+  })
+
+  it('uses the same minimal Context when the main runtime has extra services', async () => {
+    const { ctx, profile, runtime } = await setup()
+    ctx.provide('jobs', Object.freeze({ marker: 'runtime-only-service' }))
+    const environmentBranch = candidate('1', `
+      return {
+        inject: ['autodata'],
+        apply(ctx) {
+          const lookup = ctx['g' + 'et']
+          if (lookup('jobs')) ctx['pro' + 'vide']('candidate-leak', { leaked: true })
+          ctx.autodata.register({
+            id: 'bfcl-strategy', version: '1',
+            run(input) { return input.map(item => ({ record_id: item.record.source.record_id })) },
+          })
+        },
+      }
+    `)
+
+    await expect(runtime.activate(profile, null, environmentBranch, agent)).rejects.toBeInstanceOf(CandidateActivationError)
+    expect(ctx.get('jobs', true)).toEqual({ marker: 'runtime-only-service' })
+    expect(ctx.get('candidate-leak', true)).toBeUndefined()
+    expect(ctx.autodata.plugins()).toEqual([{ id: 'toolcall-h0', version: '3' }])
+    expect(ctx.dynamicCordisRunner.inventory()).toHaveLength(0)
+  })
+
+  it('removes Runner-supplied Host functions before candidate evaluation', async () => {
+    const { ctx, profile, runtime } = await setup()
+    const marker = '__autodata_candidate_host_escape__'
+    try {
+      for (const escape of [
+        'console.log.constructor',
+        'globalThis.constructor.constructor',
+        'globalThis.toString.constructor',
+        'globalThis.__proto__.constructor.constructor',
+      ]) {
+        delete (globalThis as Record<string, unknown>)[marker]
+        const hostEscape = candidate('1', `
+          const hostGlobal = ${escape}('return globalThis')()
+          hostGlobal.${marker} = true
+          return {
+            inject: ['autodata'],
+            apply(ctx) {
+              ctx.autodata.register({
+                id: 'bfcl-strategy', version: '1',
+                run(input) { return input.map(item => ({ record_id: item.record.source.record_id })) },
+              })
+            },
+          }
+        `)
+
+        await expect(runtime.activate(profile, null, hostEscape, agent), escape)
+          .rejects.toBeInstanceOf(CandidateActivationError)
+        expect((globalThis as Record<string, unknown>)[marker], escape).toBeUndefined()
+        expect(ctx.autodata.plugins(), escape).toEqual([{ id: 'toolcall-h0', version: '3' }])
+      }
+    } finally {
+      delete (globalThis as Record<string, unknown>)[marker]
+    }
+  })
+
+  it('sanitizes Host registration failures before candidate code can catch them', async () => {
+    const { ctx, profile, runtime } = await setup()
+    const marker = '__autodata_candidate_error_escape__'
+    delete (globalThis as Record<string, unknown>)[marker]
+    const errorEscape = candidate('1', `
+      return {
+        inject: ['autodata'],
+        apply(ctx) {
+          try {
+            ctx.autodata.register({
+              id: 'toolcall-h0', version: 'malicious-duplicate',
+              run(input) { return input.map(item => ({ record_id: item.record.source.record_id })) },
+            })
+          } catch (error) {
+            const hostGlobal = error.constructor.constructor(
+              'return typeof process === "undefined" ? null : globalThis',
+            )()
+            if (hostGlobal !== null) hostGlobal.${marker} = true
+          }
+        },
+      }
+    `)
+
+    try {
+      await expect(runtime.activate(profile, null, errorEscape, agent)).rejects.toBeInstanceOf(CandidateActivationError)
+      expect((globalThis as Record<string, unknown>)[marker]).toBeUndefined()
+      expect(ctx.autodata.plugins()).toEqual([{ id: 'toolcall-h0', version: '3' }])
+    } finally {
+      delete (globalThis as Record<string, unknown>)[marker]
+    }
   })
 
   it('reruns the fixed fixture in the main runtime and rejects invalid output', async () => {

@@ -1,4 +1,4 @@
-"""Strict worker for the frozen Stage 4B H0 baseline experiment.
+"""Strict worker for frozen Stage 4B H0 and first-candidate H1 experiments.
 
 The host owns experiment state and materializes an immutable staging tree.  This
 module validates that tree against the checked-in contract, runs the fixed
@@ -48,6 +48,7 @@ EVAL_REQUEST_VERSION = "autodata-experiment-eval-request-1"
 EVAL_RESULT_VERSION = "autodata-experiment-eval-result-1"
 PREDICTION_VERSION = "autodata-experiment-prediction-1"
 CONTRACT_ID = "stage4b-h0-baseline-1"
+CANDIDATE_CONTRACT_ID = "stage4c-candidate-1"
 CANONICAL_VERSION = "dataharness-canonical-tool-trajectory-3"
 LOGICAL_VERSION = "dataharness-logical-training-unit-4"
 RUN_SUMMARY_VERSION = "autodata-run-summary-1"
@@ -337,9 +338,57 @@ def _load_contract(root: Path) -> tuple[dict[str, Any], str]:
         raise ValueError("the staged experiment contract must be a regular file")
     raw_sha256 = _sha256_file(path)
     contract = _read_json(path)
-    if contract != _expected_contract():
-        raise ValueError("the staged experiment contract is not the frozen Stage 4B contract")
+    _validate_contract(contract)
     return contract, raw_sha256
+
+
+def _validate_contract(contract: dict[str, Any]) -> None:
+    """Accept the byte-compatible H0 contract or a strictly derived H1 contract."""
+
+    expected = _expected_contract()
+    if "subject" not in contract:
+        if contract != expected:
+            raise ValueError("the staged experiment contract is not the frozen Stage 4B contract")
+        return
+
+    _exact(contract, set(expected) | {"subject"}, "candidate experiment contract")
+    if contract.get("schema_version") != CONTRACT_VERSION:
+        raise ValueError("unsupported candidate experiment contract schema")
+    if contract.get("contract_id") != CANDIDATE_CONTRACT_ID:
+        raise ValueError("candidate experiment contract id is not frozen")
+    for field in ("profile", "model", "execution", "training", "evaluation", "retry"):
+        if contract.get(field) != expected[field]:
+            raise ValueError(f"candidate experiment {field} differs from the frozen H0 protocol")
+
+    subject = _object(contract.get("subject"), "candidate experiment subject")
+    _exact(subject, {
+        "candidate_id", "generation", "plugin_id", "strategy_version",
+        "host_source_sha256",
+    }, "candidate experiment subject")
+    for field in ("candidate_id", "plugin_id"):
+        if not re.fullmatch(r"[a-z][a-z0-9-]{0,47}", _text(subject.get(field), field)):
+            raise ValueError(f"candidate experiment subject {field} is invalid")
+    if subject["candidate_id"] == "h0" or _integer(subject.get("generation"), "generation", 1) != 1:
+        raise ValueError("candidate experiment subject must identify H1")
+    strategy_version = _text(subject.get("strategy_version"), "strategy_version")
+    if len(strategy_version) > 128:
+        raise ValueError("candidate strategy_version is too long")
+    if not re.fullmatch(r"[a-f0-9]{64}", _text(subject.get("host_source_sha256"), "host_source_sha256")):
+        raise ValueError("candidate host source hash is invalid")
+
+    data = _object(contract.get("data"), "candidate experiment data")
+    _exact(data, set(expected["data"]), "candidate experiment data")
+    for field in (
+        "dataset_id", "dataset_subset", "dataset_revision", "seed",
+        "canonical_records", "historical_training_tokens", "canonical_jsonl_sha256",
+    ):
+        if data.get(field) != expected["data"][field]:
+            raise ValueError(f"candidate experiment data.{field} differs from the frozen H0 source pool")
+    _text(data.get("harness_id"), "candidate experiment data.harness_id")
+    _integer(data.get("logical_training_units"), "logical_training_units", 1)
+    for field in ("logical_view_jsonl_sha256", "run_summary_json_sha256"):
+        if not re.fullmatch(r"[a-f0-9]{64}", _text(data.get(field), field)):
+            raise ValueError(f"candidate experiment data.{field} is invalid")
 
 
 def _common_request(
@@ -356,7 +405,7 @@ def _common_request(
     if request.get("schema_version") != expected_version:
         raise ValueError(f"unsupported {stage} request schema")
     contract, contract_sha256 = _load_contract(root)
-    if request.get("contract_id") != CONTRACT_ID:
+    if request.get("contract_id") != contract["contract_id"]:
         raise ValueError("request contract id is not frozen")
     if request.get("contract_sha256") != contract_sha256:
         raise ValueError("request contract SHA-256 does not match the exact staged bytes")
@@ -397,21 +446,27 @@ def _jsonl_objects(path: Path, label: str) -> list[dict[str, Any]]:
     return rows
 
 
-def _expected_source() -> dict[str, str]:
+def _expected_source(contract: Mapping[str, Any] | None = None) -> dict[str, str]:
+    data = _expected_contract()["data"] if contract is None else contract["data"]
     return {
         "adapter_id": ADAPTER_ID,
         "adapter_version": ADAPTER_VERSION,
-        "dataset_id": DATASET_ID,
-        "dataset_revision": DATASET_REVISION,
+        "dataset_id": data["dataset_id"],
+        "dataset_revision": data["dataset_revision"],
     }
 
 
-def _validate_canonical_rows(path: Path) -> tuple[list[dict[str, Any]], dict[str, int]]:
+def _validate_canonical_rows(
+    path: Path,
+    contract: Mapping[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    contract = _expected_contract() if contract is None else contract
+    expected_count = contract["data"]["canonical_records"]
     rows = _jsonl_objects(path, "canonical input")
-    if len(rows) != CANONICAL_RECORDS:
-        raise ValueError(f"canonical input must contain exactly {CANONICAL_RECORDS} records")
+    if len(rows) != expected_count:
+        raise ValueError(f"canonical input must contain exactly {expected_count} records")
     positions: dict[str, int] = {}
-    expected_source = _expected_source()
+    expected_source = _expected_source(contract)
     for position, row in enumerate(rows):
         _exact(row, CANONICAL_FIELDS, f"canonical input row {position + 1}")
         if row.get("schema_version") != CANONICAL_VERSION:
@@ -450,67 +505,140 @@ def _validate_logical_rows(
     path: Path,
     canonical_rows: list[dict[str, Any]],
     canonical_positions: Mapping[str, int],
-) -> list[dict[str, Any]]:
+    contract: Mapping[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    contract = _expected_contract() if contract is None else contract
+    expected_count = contract["data"]["logical_training_units"]
+    subject = contract.get("subject")
     training_rows = _logical_rows(path)
     raw_rows = _jsonl_objects(path, "logical input")
-    if len(raw_rows) != LOGICAL_TRAINING_UNITS or len(training_rows) != LOGICAL_TRAINING_UNITS:
-        raise ValueError(f"logical input must contain exactly {LOGICAL_TRAINING_UNITS} units")
-    expected_source = _expected_source()
+    if len(raw_rows) != expected_count or len(training_rows) != expected_count:
+        raise ValueError(f"logical input must contain exactly {expected_count} units")
+    expected_source = _expected_source(contract)
+    rank_by_record: dict[str, int] = {}
+    selected_record_ids: set[str] = set()
+    last_assistant_by_rank: dict[int, int] = {}
+    assistant_indices_by_record: dict[str, list[int]] = {}
+    previous_rank = -1
     for position, row in enumerate(raw_rows):
         _exact(row, LOGICAL_FIELDS, f"logical input row {position + 1}")
         source = _object(row.get("source"), "logical source")
         if any(source.get(key) != value for key, value in expected_source.items()):
             raise ValueError("logical input source provenance is not frozen")
         record_id = _text(source.get("record_id"), "logical source.record_id")
+        selected_record_ids.add(record_id)
         selection_rank = _integer(row.get("selection_rank"), "selection_rank")
         canonical_position = canonical_positions.get(record_id)
         if canonical_position is None:
             raise ValueError("logical input refers to an unknown canonical record")
         canonical = canonical_rows[canonical_position]
-        if selection_rank != canonical["source"]["record_index"]:
-            raise ValueError("logical selection rank does not match source record index")
+        if subject is None:
+            if selection_rank != canonical["source"]["record_index"]:
+                raise ValueError("logical selection rank does not match source record index")
+        else:
+            known_rank = rank_by_record.get(record_id)
+            if known_rank is None:
+                if selection_rank != previous_rank + 1:
+                    raise ValueError("candidate logical selection ranks are not contiguous and ordered")
+                rank_by_record[record_id] = selection_rank
+                previous_rank = selection_rank
+            elif known_rank != selection_rank or selection_rank != previous_rank:
+                raise ValueError("candidate logical units for a selected record are not contiguous")
         if source != canonical["source"] or row.get("tools") != canonical["tools"]:
             raise ValueError("logical source/tools do not match the canonical record")
-        if row.get("plugin_provenance") != [{
-            "plugin_id": PLUGIN_ID,
-            "plugin_version": PLUGIN_VERSION,
-        }]:
-            raise ValueError("logical plugin provenance is not the frozen H0 provenance")
+        provenance = row.get("plugin_provenance")
+        if subject is None:
+            if provenance != [{"plugin_id": PLUGIN_ID, "plugin_version": PLUGIN_VERSION}]:
+                raise ValueError("logical plugin provenance is not the frozen H0 provenance")
+        else:
+            if not isinstance(provenance, list) or len(provenance) != 1:
+                raise ValueError("candidate logical provenance must contain exactly one strategy")
+            entry = _object(provenance[0], "candidate logical provenance")
+            if set(entry) not in (
+                {"plugin_id", "plugin_version"},
+                {"plugin_id", "plugin_version", "note"},
+            ):
+                raise ValueError("candidate logical provenance fields are invalid")
+            if (
+                entry.get("plugin_id") != subject["plugin_id"]
+                or entry.get("plugin_version") != subject["strategy_version"]
+            ):
+                raise ValueError("candidate logical provenance does not match the contract subject")
+            if "note" in entry:
+                _text(entry.get("note"), "candidate logical provenance.note")
         assistant_index = _integer(row.get("assistant_message_index"), "assistant_message_index")
+        if assistant_index <= last_assistant_by_rank.get(selection_rank, -1):
+            raise ValueError("logical assistant targets are not in canonical message order")
+        last_assistant_by_rank[selection_rank] = assistant_index
+        assistant_indices_by_record.setdefault(record_id, []).append(assistant_index)
         messages = row.get("messages")
         assert isinstance(messages, list)
         stripped = [_without_loss(_object(message, "logical message")) for message in messages]
         if stripped != canonical["messages"][:assistant_index + 1]:
             raise ValueError("logical messages are not the canonical assistant prefix")
-    return training_rows
+        if (
+            assistant_index >= len(canonical["messages"])
+            or canonical["messages"][assistant_index].get("role") != "assistant"
+            or row.get("id") != f"{record_id}:assistant:{assistant_index}"
+        ):
+            raise ValueError("logical target identity is not canonical")
+    for record_id in rank_by_record:
+        canonical = canonical_rows[canonical_positions[record_id]]
+        expected_indices = [
+            index for index, message in enumerate(canonical["messages"])
+            if message.get("role") == "assistant"
+            and (
+                message.get("content") not in (None, "")
+                or bool(message.get("tool_calls"))
+            )
+        ]
+        if assistant_indices_by_record.get(record_id) != expected_indices:
+            raise ValueError("logical input does not contain every canonical assistant target")
+    return training_rows, len(selected_record_ids)
 
 
-def _validate_summary(path: Path) -> dict[str, Any]:
+def _validate_summary(
+    path: Path,
+    selected_source_records: int,
+    contract: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    contract = _expected_contract() if contract is None else contract
+    subject = contract.get("subject")
     summary = _read_json(path)
     _exact(summary, SUMMARY_FIELDS, "run summary")
-    expected_source = _expected_source()
+    expected_source = _expected_source(contract)
+    expected_plugins = (
+        [{"id": PLUGIN_ID, "version": PLUGIN_VERSION}]
+        if subject is None
+        else [{"id": subject["plugin_id"], "version": subject["strategy_version"]}]
+    )
     if (
         summary.get("summary_version") != RUN_SUMMARY_VERSION
-        or summary.get("harness_id") != PLUGIN_ID
-        or summary.get("generation") != 0
-        or summary.get("seed") != 42
+        or summary.get("harness_id") != contract["data"]["harness_id"]
+        or summary.get("generation") != (0 if subject is None else subject["generation"])
+        or summary.get("seed") != contract["data"]["seed"]
         or summary.get("canonical_schema_version") != CANONICAL_VERSION
         or summary.get("logical_view_schema_version") != LOGICAL_VERSION
         or summary.get("source") != expected_source
-        or summary.get("plugins") != [{"id": PLUGIN_ID, "version": PLUGIN_VERSION}]
+        or summary.get("plugins") != expected_plugins
     ):
-        raise ValueError("run summary provenance is not the frozen H0 data run")
+        raise ValueError("run summary provenance does not match the frozen experiment contract")
     counts = _object(summary.get("counts"), "run summary.counts")
     _exact(counts, COUNT_FIELDS, "run summary.counts")
     for name, value in counts.items():
         _integer(value, f"run summary.counts.{name}")
+    canonical_records = contract["data"]["canonical_records"]
+    if not 1 <= selected_source_records <= canonical_records:
+        raise ValueError("logical input has an invalid selected source record count")
+    if subject is None and selected_source_records != canonical_records:
+        raise ValueError("H0 logical input must retain every frozen canonical record")
     if counts != {
-        "source_records_read": CANONICAL_RECORDS,
-        "selected_source_records": CANONICAL_RECORDS,
+        "source_records_read": canonical_records,
+        "selected_source_records": selected_source_records,
         "quarantined_source_records": 0,
         "duplicate_source_records": 0,
-        "canonical_records": CANONICAL_RECORDS,
-        "logical_training_units": LOGICAL_TRAINING_UNITS,
+        "canonical_records": canonical_records,
+        "logical_training_units": contract["data"]["logical_training_units"],
         "validation_warnings": 0,
     }:
         raise ValueError("run summary record counts do not match the frozen data")
@@ -527,19 +655,25 @@ def _validate_summary(path: Path) -> dict[str, Any]:
 def _validate_materialized_data(
     request: Mapping[str, Any],
     root: Path,
+    contract: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
     inputs = _object(request.get("input"), "training request.input")
-    _exact(inputs, set(DATA_HASHES), "training request.input")
-    paths = {name: _input_path(root, inputs[name], name) for name in DATA_HASHES}
-    for name, expected in DATA_HASHES.items():
+    data_hashes = {
+        "canonical_jsonl": contract["data"]["canonical_jsonl_sha256"],
+        "logical_view_jsonl": contract["data"]["logical_view_jsonl_sha256"],
+        "run_summary_json": contract["data"]["run_summary_json_sha256"],
+    }
+    _exact(inputs, set(data_hashes), "training request.input")
+    paths = {name: _input_path(root, inputs[name], name) for name in data_hashes}
+    for name, expected in data_hashes.items():
         observed = _sha256_file(paths[name])
         if observed != expected:
             raise ValueError(f"{name} SHA-256 mismatch: {observed}")
-    canonical_rows, canonical_positions = _validate_canonical_rows(paths["canonical_jsonl"])
-    logical_rows = _validate_logical_rows(
-        paths["logical_view_jsonl"], canonical_rows, canonical_positions
+    canonical_rows, canonical_positions = _validate_canonical_rows(paths["canonical_jsonl"], contract)
+    logical_rows, selected_source_records = _validate_logical_rows(
+        paths["logical_view_jsonl"], canonical_rows, canonical_positions, contract
     )
-    summary = _validate_summary(paths["run_summary_json"])
+    summary = _validate_summary(paths["run_summary_json"], selected_source_records, contract)
     if summary["counts"]["canonical_records"] != len(canonical_rows):
         raise ValueError("run summary canonical count mismatch")
     if summary["counts"]["logical_training_units"] != len(logical_rows):
@@ -570,7 +704,7 @@ def _validate_train_request(path: Path) -> tuple[dict[str, Any], Path, list[dict
     expected_checkpoint = output_root / "train" / "checkpoint-16"
     if _under(root, output.get("checkpoint_dir"), "training request.output.checkpoint_dir") != expected_checkpoint:
         raise ValueError("unexpected training checkpoint path")
-    logical_rows = _validate_materialized_data(request, root)
+    logical_rows = _validate_materialized_data(request, root, contract)
     return request, root, logical_rows
 
 

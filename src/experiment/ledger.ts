@@ -35,6 +35,7 @@ import {
 export const DEFAULT_EXPERIMENT_RUN_ROOT = resolve(DEFAULT_STAGE4A_RUN_ROOT, 'experiments')
 export const DEFAULT_EXPERIMENT_STAGING_ROOT = resolve(DEFAULT_STAGE4A_STAGING_ROOT, 'experiments')
 const EXPERIMENT_PROFILE_CLAIM_VERSION = 'autodata-experiment-profile-claim-1'
+const EXPERIMENT_CANDIDATE_CLAIM_VERSION = 'autodata-experiment-candidate-claim-1'
 const TERMINAL_RUN_STATUSES = new Set(['succeeded', 'failed', 'cancelled'])
 
 let temporarySequence = 0
@@ -108,6 +109,15 @@ interface ExperimentProfileClaim {
   readonly run_id: string
 }
 
+interface ExperimentCandidateClaim {
+  readonly schema_version: typeof EXPERIMENT_CANDIDATE_CLAIM_VERSION
+  readonly contract_id: string
+  readonly contract_sha256: string
+  readonly profile_id: string
+  readonly candidate_id: string
+  readonly run_id: string
+}
+
 function normalizeProfileClaim(value: unknown, path: string): ExperimentProfileClaim {
   if (!isJsonObject(value)) throw new ExperimentError(`experiment profile claim is corrupt: ${path}`, 'STATE_CORRUPT')
   const fields = ['schema_version', 'contract_id', 'contract_sha256', 'profile_id', 'run_id'] as const
@@ -126,6 +136,29 @@ function normalizeProfileClaim(value: unknown, path: string): ExperimentProfileC
     contract_id: value.contract_id,
     contract_sha256: value.contract_sha256,
     profile_id: validateExperimentId(value.profile_id, 'profile_id'),
+    run_id: validateExperimentId(value.run_id, 'run_id'),
+  })
+}
+
+function normalizeCandidateClaim(value: unknown, path: string): ExperimentCandidateClaim {
+  if (!isJsonObject(value)) throw new ExperimentError(`experiment candidate claim is corrupt: ${path}`, 'STATE_CORRUPT')
+  const fields = ['schema_version', 'contract_id', 'contract_sha256', 'profile_id', 'candidate_id', 'run_id'] as const
+  if (Object.keys(value).length !== fields.length || fields.some(field => !Object.hasOwn(value, field))) {
+    throw new ExperimentError(`experiment candidate claim is corrupt: ${path}`, 'STATE_CORRUPT')
+  }
+  if (
+    value.schema_version !== EXPERIMENT_CANDIDATE_CLAIM_VERSION
+    || typeof value.contract_id !== 'string'
+    || value.contract_id.length === 0
+    || typeof value.contract_sha256 !== 'string'
+    || !/^[a-f0-9]{64}$/u.test(value.contract_sha256)
+  ) throw new ExperimentError(`experiment candidate claim is corrupt: ${path}`, 'STATE_CORRUPT')
+  return Object.freeze({
+    schema_version: EXPERIMENT_CANDIDATE_CLAIM_VERSION,
+    contract_id: value.contract_id,
+    contract_sha256: value.contract_sha256,
+    profile_id: validateExperimentId(value.profile_id, 'profile_id'),
+    candidate_id: validateExperimentId(value.candidate_id, 'candidate_id'),
     run_id: validateExperimentId(value.run_id, 'run_id'),
   })
 }
@@ -155,6 +188,15 @@ export class ExperimentLedger {
 
   profileClaimPath(profileId: string): string {
     return resolve(this.runRoot, '.h0-owners', `${validateExperimentId(profileId, 'profile_id')}.json`)
+  }
+
+  candidateClaimPath(profileId: string, candidateId: string): string {
+    return resolve(
+      this.runRoot,
+      '.candidate-owners',
+      validateExperimentId(profileId, 'profile_id'),
+      `${validateExperimentId(candidateId, 'candidate_id')}.json`,
+    )
   }
 
   /**
@@ -222,6 +264,58 @@ export class ExperimentLedger {
     return Object.freeze({ created: true, path })
   }
 
+  /** Permanently bind one evolved candidate to exactly one scientific run. */
+  claimCandidate(state: Pick<ExperimentState, 'contract_id' | 'contract_sha256' | 'profile_id' | 'run_id' | 'candidate_id'>): {
+    readonly created: boolean
+    readonly path: string
+  } {
+    const candidateId = state.candidate_id
+    if (candidateId === undefined) throw new ExperimentError('candidate claim requires candidate_id', 'STATE_CORRUPT')
+    const profileId = validateExperimentId(state.profile_id, 'profile_id')
+    const runId = validateExperimentId(state.run_id, 'run_id')
+    const expected: ExperimentCandidateClaim = {
+      schema_version: EXPERIMENT_CANDIDATE_CLAIM_VERSION,
+      contract_id: state.contract_id,
+      contract_sha256: state.contract_sha256,
+      profile_id: profileId,
+      candidate_id: validateExperimentId(candidateId, 'candidate_id'),
+      run_id: runId,
+    }
+    const directory = dirname(this.candidateClaimPath(profileId, candidateId))
+    const path = this.candidateClaimPath(profileId, candidateId)
+    this.files.createDirectory(this.runRoot, this.runRoot)
+    this.files.createDirectory(this.runRoot, resolve(this.runRoot, '.candidate-owners'))
+    this.files.createDirectory(this.runRoot, directory)
+    const existing = this.readCandidateClaim(path)
+    if (existing !== undefined) {
+      if (canonicalJson(existing) !== canonicalJson(expected)) {
+        throw new ExperimentError(
+          `candidate ${candidateId} is durably owned by experiment run ${existing.run_id}`,
+          'RUN_EXISTS',
+          { profile_id: profileId, run_id: runId },
+        )
+      }
+      this.assertNoOtherNonTerminalRun(profileId, runId)
+      return Object.freeze({ created: false, path })
+    }
+    this.assertNoOtherNonTerminalRun(profileId, runId)
+    try {
+      durableWriteNew(path, `${canonicalJson(expected)}\n`)
+      const descriptor = openSync(directory, constants.O_RDONLY)
+      try { fsyncSync(descriptor) } finally { closeSync(descriptor) }
+    } catch (error) {
+      if (error instanceof ExperimentError && error.code === 'ARTIFACT_EXISTS') {
+        const raced = this.readCandidateClaim(path)
+        if (raced !== undefined && canonicalJson(raced) === canonicalJson(expected)) {
+          this.assertNoOtherNonTerminalRun(profileId, runId)
+          return Object.freeze({ created: false, path })
+        }
+      }
+      throw error
+    }
+    return Object.freeze({ created: true, path })
+  }
+
   /** Release only a claim created for a run that never became durable. */
   releaseProfileClaimIfUnpublished(
     state: Pick<ExperimentState, 'contract_id' | 'contract_sha256' | 'profile_id' | 'run_id'>,
@@ -254,6 +348,42 @@ export class ExperimentLedger {
       if (error instanceof ExperimentError) throw error
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
       throw storeError(`cannot release unpublished experiment profile claim: ${path}`, error)
+    }
+  }
+
+  /** Release only a candidate claim whose run directory was never published. */
+  releaseCandidateClaimIfUnpublished(
+    state: Pick<ExperimentState, 'contract_id' | 'contract_sha256' | 'profile_id' | 'run_id' | 'candidate_id'>,
+    claimWasCreated: boolean,
+  ): boolean {
+    if (!claimWasCreated || state.candidate_id === undefined || existsSync(this.runDirectory(state.profile_id, state.run_id))) return false
+    const path = this.candidateClaimPath(state.profile_id, state.candidate_id)
+    const existing = this.readCandidateClaim(path)
+    if (existing === undefined) return false
+    const expected: ExperimentCandidateClaim = {
+      schema_version: EXPERIMENT_CANDIDATE_CLAIM_VERSION,
+      contract_id: state.contract_id,
+      contract_sha256: state.contract_sha256,
+      profile_id: state.profile_id,
+      candidate_id: state.candidate_id,
+      run_id: state.run_id,
+    }
+    if (canonicalJson(existing) !== canonicalJson(expected)) {
+      throw new ExperimentError('refusing to release a different experiment candidate claim', 'STATE_CORRUPT')
+    }
+    try {
+      const stat = lstatSync(path)
+      if (stat.isSymbolicLink() || !stat.isFile()) {
+        throw new ExperimentError(`experiment candidate claim is not a regular file: ${path}`, 'PATH_ESCAPE')
+      }
+      unlinkSync(path)
+      const descriptor = openSync(dirname(path), constants.O_RDONLY)
+      try { fsyncSync(descriptor) } finally { closeSync(descriptor) }
+      return true
+    } catch (error) {
+      if (error instanceof ExperimentError) throw error
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+      throw storeError(`cannot release unpublished experiment candidate claim: ${path}`, error)
     }
   }
 
@@ -456,6 +586,7 @@ export class ExperimentLedger {
     }
     if (state.train_result_path !== undefined) assertContained(run, state.train_result_path, 'training result path')
     if (state.eval_result_path !== undefined) assertContained(run, state.eval_result_path, 'evaluation result path')
+    if (state.decision_path !== undefined) assertContained(run, state.decision_path, 'decision path')
     return immutableJson(state) as unknown as ExperimentState
   }
 
@@ -479,6 +610,16 @@ export class ExperimentLedger {
       throw storeError(`cannot inspect experiment profile claim: ${path}`, error)
     }
     return normalizeProfileClaim(this.readJson(this.runRoot, path, 'experiment profile claim'), path)
+  }
+
+  private readCandidateClaim(path: string): ExperimentCandidateClaim | undefined {
+    try {
+      lstatSync(path)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+      throw storeError(`cannot inspect experiment candidate claim: ${path}`, error)
+    }
+    return normalizeCandidateClaim(this.readJson(this.runRoot, path, 'experiment candidate claim'), path)
   }
 
   private assertNoOtherNonTerminalRun(profileId: string, allowedRunId: string): void {

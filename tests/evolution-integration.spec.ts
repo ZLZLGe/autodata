@@ -78,7 +78,7 @@ describe('Stage 3A full lifecycle', () => {
     })
     expect(validated.validation.ok).toBe(true)
 
-    const accepted = await first.recordEvaluation({
+    const evaluation = {
       schema_version: EVALUATION_REPORT_SCHEMA_VERSION,
       report_id: 'report-one',
       profile_id: 'bfcl',
@@ -92,7 +92,8 @@ describe('Stage 3A full lifecycle', () => {
       cases_expected: 10,
       baseline_candidate_id: 'h0',
       baseline_score: 0.5,
-    }, agent)
+    } as const
+    const accepted = await first.recordEvaluation(evaluation, agent)
     expect(accepted.decision.accepted).toBe(true)
     expect(ctx.autodata.plugins()).toContainEqual({ id: 'bfcl-strategy', version: '1' })
 
@@ -107,7 +108,7 @@ describe('Stage 3A full lifecycle', () => {
     expect(ctx.get('autodata', false)).toBeUndefined()
     expect(ctx.get('dynamicCordisRunner', true)).toBeUndefined()
 
-    await ctx.plugin(AutoDataService, {
+    const replayFiber = await ctx.plugin(AutoDataService, {
       store: new FileEvolutionStore(root),
       validator: validator(),
     })
@@ -115,9 +116,21 @@ describe('Stage 3A full lifecycle', () => {
     expect(resumed.status('bfcl').state.active_candidate_id).toBe('candidate-one')
     expect(ctx.autodata.plugins()).not.toContainEqual(expect.objectContaining({ id: 'bfcl-strategy' }))
 
-    await resumed.resume('bfcl', agent)
+    const replayed = await resumed.recordEvaluation(evaluation, agent)
+    expect(replayed.decision.accepted).toBe(true)
     expect(ctx.autodata.plugins()).toContainEqual({ id: 'bfcl-strategy', version: '1' })
-    const rolledBack = await resumed.rollback('bfcl', 'h0', agent)
+
+    await replayFiber.dispose()
+    await ctx.plugin(AutoDataService, {
+      store: new FileEvolutionStore(root),
+      validator: validator(),
+    })
+    const restarted = getEvolutionController(ctx)
+    expect(ctx.autodata.plugins()).not.toContainEqual(expect.objectContaining({ id: 'bfcl-strategy' }))
+    await restarted.resume('bfcl', agent)
+    expect(ctx.autodata.plugins()).toContainEqual({ id: 'bfcl-strategy', version: '1' })
+
+    const rolledBack = await restarted.rollback('bfcl', 'h0', agent)
     expect(rolledBack.state.active_candidate_id).toBe('h0')
     expect(rolledBack.state.active_evaluation).toMatchObject({ report_id: 'report-h0', score: 0.5 })
     expect(ctx.autodata.plugins()).toEqual([{ id: 'toolcall-h0', version: '3' }])

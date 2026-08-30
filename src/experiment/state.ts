@@ -3,6 +3,7 @@
 import { createHash } from 'node:crypto'
 import { immutableJson, isJsonObject } from '../core/json.js'
 import { validateExperimentId } from './contracts.js'
+import type { AcceptanceDecision, AcceptanceDecisionReason } from '../evolution/types.js'
 import {
   EXPERIMENT_STAGES,
   EXPERIMENT_STATE_VERSION,
@@ -23,7 +24,13 @@ const ERROR_CODES = new Set<ExperimentErrorCode>([
   'INVALID_REQUEST', 'RUN_EXISTS', 'RUN_NOT_FOUND', 'STATE_CORRUPT', 'ARTIFACT_EXISTS',
   'ARTIFACT_INVALID', 'PATH_ESCAPE', 'DEPENDENCY_UNAVAILABLE', 'DRY_RUN_FAILED',
     'UNSCHEDULABLE', 'SUBMIT_FAILED', 'REMOTE_FAILED', 'WORKER_FAILED', 'RECOVERY_REQUIRED',
-  'CANCEL_FAILED', 'STORE_IO', 'BASELINE_REGISTRATION_FAILED',
+  'CANCEL_FAILED', 'STORE_IO', 'BASELINE_REGISTRATION_FAILED', 'EVALUATION_REGISTRATION_FAILED',
+])
+const DECISION_REASONS = new Set<AcceptanceDecisionReason>([
+  'accepted_strict_improvement', 'candidate_not_found', 'candidate_not_validated',
+  'profile_mismatch', 'report_incomplete', 'wrong_split', 'wrong_metric', 'wrong_benchmark',
+  'baseline_missing', 'baseline_fields_incomplete', 'baseline_candidate_mismatch',
+  'baseline_score_mismatch', 'not_strictly_better', 'runtime_activation_failed',
 ])
 
 function corrupt(message: string): never {
@@ -59,6 +66,38 @@ function integer(value: unknown, label: string, minimum = 0): number {
     corrupt(`${label} must be an integer >= ${String(minimum)}`)
   }
   return value
+}
+
+function score(value: unknown, label: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1) {
+    corrupt(`${label} must be a finite score between 0 and 1`)
+  }
+  return value
+}
+
+function normalizeDecision(value: unknown, candidateId: string): AcceptanceDecision {
+  const item = record(value, 'experiment decision')
+  exact(item, ['candidate_id', 'accepted', 'reason'], [
+    'split', 'metric', 'candidate_score', 'baseline_score',
+  ], 'experiment decision')
+  const decisionCandidateId = validateExperimentId(item.candidate_id, 'experiment decision.candidate_id')
+  if (decisionCandidateId !== candidateId) corrupt('experiment decision candidate_id does not match the run candidate')
+  if (typeof item.accepted !== 'boolean') corrupt('experiment decision.accepted must be a boolean')
+  if (typeof item.reason !== 'string' || !DECISION_REASONS.has(item.reason as AcceptanceDecisionReason)) {
+    corrupt('experiment decision.reason is invalid')
+  }
+  if (item.split !== undefined && !['B_search', 'B_dev', 'B_test'].includes(item.split as string)) {
+    corrupt('experiment decision.split is invalid')
+  }
+  return Object.freeze({
+    candidate_id: decisionCandidateId,
+    accepted: item.accepted,
+    reason: item.reason as AcceptanceDecisionReason,
+    ...(item.split === undefined ? {} : { split: item.split as 'B_search' | 'B_dev' | 'B_test' }),
+    ...(item.metric === undefined ? {} : { metric: text(item.metric, 'experiment decision.metric') }),
+    ...(item.candidate_score === undefined ? {} : { candidate_score: score(item.candidate_score, 'experiment decision.candidate_score') }),
+    ...(item.baseline_score === undefined ? {} : { baseline_score: score(item.baseline_score, 'experiment decision.baseline_score') }),
+  })
 }
 
 function timestamp(value: unknown, label: string): string {
@@ -150,6 +189,8 @@ export function createInitialExperimentState(input: {
   readonly run_directory: string
   readonly staging_directory: string
   readonly now: string
+  readonly candidate_id?: string
+  readonly candidate_generation?: number
 }): ExperimentState {
   return normalizeExperimentState({
     schema_version: EXPERIMENT_STATE_VERSION,
@@ -164,6 +205,10 @@ export function createInitialExperimentState(input: {
     created_at: input.now,
     updated_at: input.now,
     attempts: [],
+    ...(input.candidate_id === undefined ? {} : {
+      candidate_id: input.candidate_id,
+      candidate_generation: input.candidate_generation,
+    }),
   })
 }
 
@@ -173,7 +218,8 @@ export function normalizeExperimentState(input: unknown): ExperimentState {
     'schema_version', 'contract_id', 'contract_sha256', 'profile_id', 'run_id', 'status', 'phase',
     'run_directory', 'staging_directory', 'created_at', 'updated_at', 'attempts',
   ], [
-    'train_result_path', 'eval_result_path', 'feedback_id', 'evaluation_report_id', 'failure',
+    'candidate_id', 'candidate_generation', 'train_result_path', 'eval_result_path', 'feedback_id',
+    'evaluation_report_id', 'decision_path', 'decision', 'failure',
   ], 'experiment state')
   if (value.schema_version !== EXPERIMENT_STATE_VERSION) corrupt('unsupported experiment state schema')
   const profileId = validateExperimentId(value.profile_id, 'profile_id')
@@ -184,6 +230,27 @@ export function normalizeExperimentState(input: unknown): ExperimentState {
   ].includes(value.phase)) corrupt('experiment state.phase is invalid')
   if (!Array.isArray(value.attempts)) corrupt('experiment state.attempts must be an array')
   const attempts = value.attempts.map(normalizeAttempt)
+  if ((value.candidate_id === undefined) !== (value.candidate_generation === undefined)) {
+    corrupt('candidate_id and candidate_generation must be recorded together')
+  }
+  const candidateId = value.candidate_id === undefined
+    ? undefined
+    : validateExperimentId(value.candidate_id, 'candidate_id')
+  const candidateGeneration = value.candidate_generation === undefined
+    ? undefined
+    : integer(value.candidate_generation, 'candidate_generation', 1)
+  if (candidateGeneration !== undefined && candidateGeneration !== 1) {
+    corrupt('the Stage 4C experiment supports only the first evolved generation')
+  }
+  if ((value.decision === undefined) !== (value.decision_path === undefined)) {
+    corrupt('decision and decision_path must be recorded together')
+  }
+  if (value.decision !== undefined && candidateId === undefined) {
+    corrupt('an H0 experiment cannot contain an acceptance decision')
+  }
+  const decision = value.decision === undefined
+    ? undefined
+    : normalizeDecision(value.decision, candidateId as string)
   for (const attemptStage of EXPERIMENT_STAGES) {
     const stageAttempts = attempts.filter(attempt => attempt.stage === attemptStage)
     if (stageAttempts.some((attempt, index) => attempt.attempt !== index + 1)) {
@@ -218,10 +285,15 @@ export function normalizeExperimentState(input: unknown): ExperimentState {
     created_at: timestamp(value.created_at, 'experiment state.created_at'),
     updated_at: timestamp(value.updated_at, 'experiment state.updated_at'),
     attempts,
+    ...(candidateId === undefined ? {} : { candidate_id: candidateId, candidate_generation: candidateGeneration as number }),
     ...(value.train_result_path === undefined ? {} : { train_result_path: absolute(value.train_result_path, 'experiment state.train_result_path') }),
     ...(value.eval_result_path === undefined ? {} : { eval_result_path: absolute(value.eval_result_path, 'experiment state.eval_result_path') }),
     ...(value.feedback_id === undefined ? {} : { feedback_id: validateExperimentId(value.feedback_id, 'feedback_id') }),
     ...(value.evaluation_report_id === undefined ? {} : { evaluation_report_id: validateExperimentId(value.evaluation_report_id, 'evaluation_report_id') }),
+    ...(value.decision_path === undefined ? {} : {
+      decision_path: absolute(value.decision_path, 'experiment state.decision_path'),
+      decision: decision as AcceptanceDecision,
+    }),
     ...(failure === undefined ? {} : { failure }),
   }
   if (state.phase === 'initializing' && (
@@ -236,11 +308,18 @@ export function normalizeExperimentState(input: unknown): ExperimentState {
   if (['registering', 'complete'].includes(state.phase) && state.eval_result_path === undefined) {
     corrupt(`${state.phase} experiment state is missing its evaluation result`)
   }
-  if (state.status === 'succeeded' && (
-    state.phase !== 'complete'
-    || state.feedback_id === undefined
+  if (state.status === 'succeeded' && state.phase !== 'complete') {
+    corrupt('a succeeded experiment must be complete')
+  }
+  if (state.status === 'succeeded' && state.candidate_id === undefined && (
+    state.feedback_id === undefined || state.evaluation_report_id === undefined
+  )) corrupt('a succeeded H0 experiment must contain both durable baseline record identifiers')
+  if (state.status === 'succeeded' && state.candidate_id !== undefined && (
+    state.feedback_id !== undefined
     || state.evaluation_report_id === undefined
-  )) corrupt('a succeeded experiment must contain both durable H0 record identifiers')
+    || state.decision === undefined
+    || state.decision_path === undefined
+  )) corrupt('a succeeded H1 experiment must contain its durable evaluation decision and no current feedback id')
   return immutableJson(state) as unknown as ExperimentState
 }
 

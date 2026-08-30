@@ -68,7 +68,10 @@ async function runSmoke() {
       { default: ToolRuntime },
       { default: AutoDataService, getEvolutionController },
       AutoDataTool,
-      { EVOLUTION_FEEDBACK_SCHEMA_VERSION },
+      {
+        EVALUATION_REPORT_SCHEMA_VERSION,
+        EVOLUTION_FEEDBACK_SCHEMA_VERSION,
+      },
     ] = await Promise.all([
       import('@deepseek-ai/cordis'),
       import('@deepseek-ai/dsh-agent'),
@@ -105,6 +108,21 @@ async function runSmoke() {
     await ctx.plugin(AgentLoop, { agents: [] })
 
     const controller = getEvolutionController(ctx)
+    // Candidate submission requires a durable H0. This deterministic report is
+    // smoke scaffolding only; it is not evidence from a formal experiment.
+    controller.registerBaseline({
+      schema_version: EVALUATION_REPORT_SCHEMA_VERSION,
+      report_id: 'freerouter-smoke-report-h0',
+      profile_id: PROFILE_ID,
+      candidate_id: 'h0',
+      benchmark: BENCHMARK,
+      split: 'B_dev',
+      metric: 'accuracy',
+      score: 0.5,
+      complete: true,
+      cases_evaluated: 1,
+      cases_expected: 1,
+    })
     controller.recordFeedback({
       schema_version: EVOLUTION_FEEDBACK_SCHEMA_VERSION,
       feedback_id: 'freerouter-smoke-feedback-h0',

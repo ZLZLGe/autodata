@@ -1,4 +1,4 @@
-/** Host-only orchestration for the frozen Stage 4B H0 experiment. */
+/** Host-only orchestration for frozen H0 and first-candidate H1 experiments. */
 
 import type { Context } from '@deepseek-ai/cordis'
 import { JobId } from '@deepseek-ai/dsh-jobs'
@@ -17,12 +17,15 @@ import {
   EVALUATION_REPORT_SCHEMA_VERSION,
   EVOLUTION_FEEDBACK_SCHEMA_VERSION,
   H0_CANDIDATE_ID,
+  candidateFrozenSelectionRuntimeBinding,
   normalizeEvaluationReport,
   normalizeEvolutionFeedback,
   recordEvolutionFeedback,
   type EvaluationReport,
   type EvolutionFeedback,
+  type FrozenSelectionRuntimeBinding,
 } from '../evolution/index.js'
+import { GENERATION_MATERIALIZATION_VERSION } from '../generation/types.js'
 import { Stage4ARJobClient } from '../stage4a/rjob.js'
 import type {
   Stage4ACommandResult,
@@ -31,6 +34,7 @@ import type {
 } from '../stage4a/types.js'
 import {
   createExperimentEvalRequest,
+  createCandidateExperimentContract,
   createExperimentTrainRequest,
   experimentArtifactHashes,
   loadExperimentContract,
@@ -53,6 +57,7 @@ import { sleepWithAbort } from './sleep.js'
 import {
   ExperimentError,
   type ExperimentAttempt,
+  type ExperimentCandidateSubject,
   type ExperimentCommandResult,
   type ExperimentContract,
   type ExperimentControllerOptions,
@@ -62,6 +67,7 @@ import {
   type ExperimentJobRegistry,
   type ExperimentMaterializedData,
   type ExperimentRJobBackend,
+  type ExperimentRuntimeAgent,
   type ExperimentStage,
   type ExperimentStartRequest,
   type ExperimentState,
@@ -73,7 +79,7 @@ const OUTPUT_LIMIT_BYTES = 64 * 1024
 const PREDICTIONS_LIMIT_BYTES = 16 * 1024 * 1024
 const DEFAULT_POLL_INTERVAL_MS = 30_000
 const REQUEST_ENVIRONMENT = 'AUTODATA_EXPERIMENT_REQUEST'
-const STAGE4B_FILES = Object.freeze([
+const EXPERIMENT_FILES = Object.freeze([
   '.rjobignore',
   'train.sh',
   'eval.sh',
@@ -95,7 +101,7 @@ const EXPERIMENT_ERROR_CODES = new Set<ExperimentErrorCode>([
   'INVALID_REQUEST', 'RUN_EXISTS', 'RUN_NOT_FOUND', 'STATE_CORRUPT', 'ARTIFACT_EXISTS',
   'ARTIFACT_INVALID', 'PATH_ESCAPE', 'DEPENDENCY_UNAVAILABLE', 'DRY_RUN_FAILED',
   'UNSCHEDULABLE', 'SUBMIT_FAILED', 'REMOTE_FAILED', 'WORKER_FAILED', 'RECOVERY_REQUIRED',
-  'CANCEL_FAILED', 'STORE_IO', 'BASELINE_REGISTRATION_FAILED',
+  'CANCEL_FAILED', 'STORE_IO', 'BASELINE_REGISTRATION_FAILED', 'EVALUATION_REGISTRATION_FAILED',
 ])
 
 interface LiveRun {
@@ -111,6 +117,12 @@ interface LiveRun {
 interface PreparedData {
   readonly materialized: ExperimentMaterializedData
   readonly files: Readonly<Record<'canonical.jsonl' | 'logical-view.jsonl' | 'run-summary.json', string>>
+}
+
+interface BoundContract {
+  readonly contract: ExperimentContract
+  readonly sha256: string
+  readonly text: string
 }
 
 function runKey(profileId: string, runId: string): string {
@@ -191,7 +203,10 @@ function assertSourceFile(rootInput: string, relativePath: string): string {
   return target
 }
 
-function prepareData(dataRunInput: DataRunResult, stagingDirectory: string, contract: ExperimentContract): PreparedData {
+function serializeDataRun(dataRunInput: DataRunResult): {
+  readonly data: DataRunResult
+  readonly files: PreparedData['files']
+} {
   let cloned: unknown
   try {
     cloned = cloneJson(dataRunInput)
@@ -212,6 +227,22 @@ function prepareData(dataRunInput: DataRunResult, stagingDirectory: string, cont
     || summary.canonical_schema_version !== CANONICAL_TRAJECTORY_SCHEMA_VERSION
     || summary.logical_view_schema_version !== LOGICAL_TRAINING_UNIT_SCHEMA_VERSION
   ) throw new ExperimentError('data_run schema versions do not match the current Core', 'INVALID_REQUEST')
+  const files = Object.freeze({
+    'canonical.jsonl': jsonLines(data.canonical_records),
+    'logical-view.jsonl': jsonLines(data.logical_training_view),
+    'run-summary.json': `${canonicalJson(summary)}\n`,
+  })
+  return Object.freeze({ data, files })
+}
+
+function prepareData(
+  serialized: ReturnType<typeof serializeDataRun>,
+  stagingDirectory: string,
+  contract: ExperimentContract,
+  baseline: ExperimentContract,
+): PreparedData {
+  const { data, files } = serialized
+  const summary = data.summary
   if (
     summary.harness_id !== contract.data.harness_id
     || summary.seed !== contract.data.seed
@@ -230,17 +261,52 @@ function prepareData(dataRunInput: DataRunResult, stagingDirectory: string, cont
   if (data.logical_training_view.some(unit => unit.schema_version !== LOGICAL_TRAINING_UNIT_SCHEMA_VERSION)) {
     throw new ExperimentError('data_run contains an unsupported logical training unit', 'INVALID_REQUEST')
   }
-  const files = Object.freeze({
-    'canonical.jsonl': jsonLines(data.canonical_records),
-    'logical-view.jsonl': jsonLines(data.logical_training_view),
-    'run-summary.json': `${canonicalJson(summary)}\n`,
-  })
   const hashes = experimentArtifactHashes(files)
   if (
     hashes['canonical.jsonl'] !== contract.data.canonical_jsonl_sha256
     || hashes['logical-view.jsonl'] !== contract.data.logical_view_jsonl_sha256
     || hashes['run-summary.json'] !== contract.data.run_summary_json_sha256
   ) throw new ExperimentError('materialized data hashes do not match the frozen experiment contract', 'INVALID_REQUEST')
+  if (contract.subject !== undefined) {
+    if (
+      hashes['canonical.jsonl'] !== baseline.data.canonical_jsonl_sha256
+      || contract.data.canonical_records !== baseline.data.canonical_records
+    ) throw new ExperimentError('H1 must use the exact frozen H0 canonical source pool', 'INVALID_REQUEST')
+    if (summary.generation !== contract.subject.generation) {
+      throw new ExperimentError('H1 data_run generation does not match the candidate', 'INVALID_REQUEST')
+    }
+    if (canonicalJson(summary.plugins) !== canonicalJson([{
+      id: contract.subject.plugin_id,
+      version: contract.subject.strategy_version,
+    }])) throw new ExperimentError('H1 data_run plugin identity does not match the candidate', 'INVALID_REQUEST')
+    const canonicalById = new Map(data.canonical_records.map(record => [record.source.record_id, record]))
+    const rankByRecord = new Map<string, number>()
+    let previousRank = -1
+    for (const unit of data.logical_training_view) {
+      const canonical = canonicalById.get(unit.source.record_id)
+      if (canonical === undefined || canonicalJson(unit.source) !== canonicalJson(canonical.source)) {
+        throw new ExperimentError('H1 logical view must reference the frozen canonical source pool', 'INVALID_REQUEST')
+      }
+      const existingRank = rankByRecord.get(unit.source.record_id)
+      if (existingRank !== undefined && existingRank !== unit.selection_rank) {
+        throw new ExperimentError('H1 logical view assigns one record to multiple selection ranks', 'INVALID_REQUEST')
+      }
+      if (existingRank === undefined) {
+        if (unit.selection_rank !== previousRank + 1) {
+          throw new ExperimentError('H1 logical view selection ranks must be contiguous and ordered', 'INVALID_REQUEST')
+        }
+        rankByRecord.set(unit.source.record_id, unit.selection_rank)
+        previousRank = unit.selection_rank
+      } else if (unit.selection_rank !== previousRank) {
+        throw new ExperimentError('H1 logical units for a selected record must remain contiguous', 'INVALID_REQUEST')
+      }
+      if (
+        unit.plugin_provenance.length !== 1
+        || unit.plugin_provenance[0]?.plugin_id !== contract.subject.plugin_id
+        || unit.plugin_provenance[0]?.plugin_version !== contract.subject.strategy_version
+      ) throw new ExperimentError('H1 logical view provenance does not match the candidate', 'INVALID_REQUEST')
+    }
+  }
   return Object.freeze({
     files,
     materialized: Object.freeze({
@@ -256,9 +322,9 @@ export class ExperimentController {
   private readonly ledger: ExperimentLedger
   private readonly assetRoot: string
   private readonly commonWorkerRoot: string
-  private readonly contract: ExperimentContract
-  private readonly contractSha256: string
-  private readonly contractText: string
+  private readonly baselineContract: ExperimentContract
+  private readonly baselineContractSha256: string
+  private readonly baselineContractText: string
   private readonly pollIntervalMs: number
   private readonly now: () => Date
   private readonly sleep: (milliseconds: number, signal: AbortSignal) => Promise<void>
@@ -276,9 +342,12 @@ export class ExperimentController {
       ?? fileURLToPath(new URL('../../stage4a/python/autodata_stage4a', import.meta.url)))
     const contractPath = resolve(this.assetRoot, 'experiment-contract.json')
     const loaded = loadExperimentContract(contractPath)
-    this.contract = loaded.contract
-    this.contractSha256 = loaded.sha256
-    this.contractText = readFileSync(contractPath, 'utf8')
+    if (loaded.contract.subject !== undefined) {
+      throw new ExperimentError('configured experiment asset must be the checked-in H0 baseline contract', 'ARTIFACT_INVALID')
+    }
+    this.baselineContract = loaded.contract
+    this.baselineContractSha256 = loaded.sha256
+    this.baselineContractText = readFileSync(contractPath, 'utf8')
     const pollInterval = options.poll_interval_ms ?? DEFAULT_POLL_INTERVAL_MS
     if (!Number.isFinite(pollInterval) || pollInterval < 0) {
       throw new ExperimentError('poll_interval_ms must be a finite non-negative number', 'INVALID_REQUEST')
@@ -290,40 +359,73 @@ export class ExperimentController {
     this.jobsValue = options.jobs
   }
 
-  start(requestInput: ExperimentStartRequest): ExperimentStatus {
+  start(requestInput: ExperimentStartRequest, agent?: ExperimentRuntimeAgent): ExperimentStatus {
     this.assertUsable()
     const request = normalizeExperimentStartRequest(requestInput)
-    this.assertProfile(request.profile_id, false)
+    if (request.subject !== undefined && agent === undefined) {
+      throw new ExperimentError('an H1 experiment requires a process-local runtime Agent', 'INVALID_REQUEST')
+    }
+    const runtimeBinding = this.assertProfile(request.profile_id, false, undefined, request.subject)
     const key = runKey(request.profile_id, request.run_id)
     if (this.live.has(key)) throw new ExperimentError(`experiment ${request.profile_id}/${request.run_id} is already live`, 'RUN_EXISTS')
     if ([...this.live.keys()].some(value => value.startsWith(`${request.profile_id}\0`))) {
-      throw new ExperimentError(`TaskProfile ${request.profile_id} already has a live H0 experiment`, 'RUN_EXISTS')
+      throw new ExperimentError(`TaskProfile ${request.profile_id} already has a live experiment`, 'RUN_EXISTS')
     }
     const runDirectory = this.ledger.runDirectory(request.profile_id, request.run_id)
     const stagingDirectory = this.ledger.stagingDirectory(request.run_id)
-    const prepared = prepareData(request.data_run, stagingDirectory, this.contract)
+    const serialized = serializeDataRun(request.data_run)
+    if (request.subject !== undefined) {
+      if (runtimeBinding === undefined) {
+        throw new ExperimentError('H1 subject is missing its durable runtime binding', 'INVALID_REQUEST')
+      }
+      this.assertCandidateMaterializationBinding(request.subject, runtimeBinding, serialized)
+    }
+    const binding: BoundContract = request.subject === undefined
+      ? {
+        contract: this.baselineContract,
+        sha256: this.baselineContractSha256,
+        text: this.baselineContractText,
+      }
+      : (() => {
+        const contract = createCandidateExperimentContract({
+          baseline: this.baselineContract,
+          subject: request.subject,
+          data_run: serialized.data,
+          artifact_hashes: experimentArtifactHashes(serialized.files),
+        })
+        const text = `${canonicalJson(contract)}\n`
+        return { contract, sha256: sha256(text), text }
+      })()
+    const prepared = prepareData(serialized, stagingDirectory, binding.contract, this.baselineContract)
     const createdAt = nowIso(this.now)
     let state = createInitialExperimentState({
-      contract_id: this.contract.contract_id,
-      contract_sha256: this.contractSha256,
+      contract_id: binding.contract.contract_id,
+      contract_sha256: binding.sha256,
       profile_id: request.profile_id,
       run_id: request.run_id,
       run_directory: runDirectory,
       staging_directory: stagingDirectory,
       now: createdAt,
+      ...(request.subject === undefined ? {} : {
+        candidate_id: request.subject.candidate_id,
+        candidate_generation: request.subject.generation,
+      }),
     })
-    const claim = this.ledger.claimProfile(state)
+    const claim = request.subject === undefined
+      ? this.ledger.claimProfile(state)
+      : this.ledger.claimCandidate(state)
     try {
       state = this.ledger.initializeRun(state, {
         ...prepared.files,
         'materialized.json': `${canonicalJson(prepared.materialized)}\n`,
-        'experiment-contract.json': this.contractText,
+        'experiment-contract.json': binding.text,
       })
       state = this.completeInitialization(state)
-      return this.launch(state, false)
+      return this.launch(state, false, agent)
     } catch (error) {
       try {
-        this.ledger.releaseProfileClaimIfUnpublished(state, claim.created)
+        if (request.subject === undefined) this.ledger.releaseProfileClaimIfUnpublished(state, claim.created)
+        else this.ledger.releaseCandidateClaimIfUnpublished(state, claim.created)
       } catch (cleanupError) {
         throw new ExperimentError('experiment initialization failed and its unpublished profile claim could not be released', 'STORE_IO', {
           profile_id: state.profile_id,
@@ -345,7 +447,7 @@ export class ExperimentController {
     return Object.freeze({ state, ...(jobId === undefined ? {} : { job_id: jobId }) })
   }
 
-  resume(profileIdInput: string, runIdInput: string): ExperimentStatus {
+  resume(profileIdInput: string, runIdInput: string, agent?: ExperimentRuntimeAgent): ExperimentStatus {
     this.assertUsable()
     const profileId = validateExperimentId(profileIdInput, 'profile_id')
     const runId = validateExperimentId(runIdInput, 'run_id')
@@ -353,16 +455,21 @@ export class ExperimentController {
       throw new ExperimentError(`experiment ${profileId}/${runId} is already live`, 'RUN_EXISTS')
     }
     if ([...this.live.keys()].some(value => value.startsWith(`${profileId}\0`))) {
-      throw new ExperimentError(`TaskProfile ${profileId} already has a live H0 experiment`, 'RUN_EXISTS')
+      throw new ExperimentError(`TaskProfile ${profileId} already has a live experiment`, 'RUN_EXISTS')
     }
     const state = this.ledger.loadState(profileId, runId)
-    this.assertContractBinding(state)
-    this.ledger.claimProfile(state)
-    if (state.status === 'succeeded' || state.status === 'failed' || state.status === 'cancelled') {
+    const contract = this.assertContractBinding(state)
+    if (contract.subject === undefined) this.ledger.claimProfile(state)
+    else this.ledger.claimCandidate(state)
+    if (state.status === 'failed' || state.status === 'cancelled') {
       return Object.freeze({ state })
     }
-    this.assertProfile(profileId, true, state)
-    return this.launch(state, true)
+    if (state.status === 'succeeded' && contract.subject === undefined) return Object.freeze({ state })
+    if (contract.subject !== undefined && agent === undefined) {
+      throw new ExperimentError('resuming an H1 experiment requires a process-local runtime Agent', 'INVALID_REQUEST')
+    }
+    if (state.status !== 'succeeded') this.assertProfile(profileId, true, state, contract.subject)
+    return this.launch(state, true, agent)
   }
 
   async cancel(profileIdInput: string, runIdInput: string): Promise<ExperimentStatus> {
@@ -377,14 +484,15 @@ export class ExperimentController {
       return this.status(profileId, runId)
     }
     let state = this.ledger.loadState(profileId, runId)
-    this.assertContractBinding(state)
-    this.ledger.claimProfile(state)
+    const contract = this.assertContractBinding(state)
+    if (contract.subject === undefined) this.ledger.claimProfile(state)
+    else this.ledger.claimCandidate(state)
     if (state.status === 'succeeded' || state.status === 'failed' || state.status === 'cancelled') {
       return Object.freeze({ state })
     }
     if (state.phase === 'registering') {
       throw new ExperimentError(
-        'baseline registration may already have committed; resume the experiment to reconcile it',
+        'evaluation registration may already have committed; resume the experiment to reconcile it',
         'RECOVERY_REQUIRED',
         { profile_id: profileId, run_id: runId },
       )
@@ -414,7 +522,7 @@ export class ExperimentController {
     this.detachJobController = undefined
   }
 
-  private launch(state: ExperimentState, recovering: boolean): ExperimentStatus {
+  private launch(state: ExperimentState, recovering: boolean, agent?: ExperimentRuntimeAgent): ExperimentStatus {
     const jobs = this.jobs()
     this.ensureJobController(jobs)
     const key = runKey(state.profile_id, state.run_id)
@@ -427,7 +535,7 @@ export class ExperimentController {
         const abort = new AbortController()
         const output: string[] = []
         const holder: LiveRun = { abort, output, done: Promise.resolve({ status: 'failed' }) }
-        const done = this.execute(state.profile_id, state.run_id, recovering, holder)
+        const done = this.execute(state.profile_id, state.run_id, recovering, holder, agent)
           .catch(error => ({ status: 'failed' as const, detail: errorMessage(error), output: errorMessage(error) }))
           .finally(() => {
             this.live.delete(key)
@@ -462,25 +570,52 @@ export class ExperimentController {
     runId: string,
     recovering: boolean,
     live: LiveRun,
+    agent?: ExperimentRuntimeAgent,
   ): Promise<import('@deepseek-ai/dsh-jobs').JobOutcome> {
     let state = this.ledger.loadState(profileId, runId)
+    const contract = this.assertContractBinding(state)
+    const completedCandidateReplay = state.status === 'succeeded'
+      && state.phase === 'complete'
+      && contract.subject !== undefined
     try {
+      if (completedCandidateReplay) {
+        if (agent === undefined || state.decision === undefined) {
+          throw new ExperimentError('completed H1 runtime reconciliation requires its Agent and decision', 'STATE_CORRUPT')
+        }
+        const resumed = await this.options.evolution.resume(profileId, agent)
+        const expectedActive = state.decision.accepted ? contract.subject.candidate_id : H0_CANDIDATE_ID
+        const expectedStatus = state.decision.accepted ? 'accepted' : 'rejected'
+        const candidate = resumed.state.candidates.find(value => value.candidate_id === contract.subject?.candidate_id)
+        if (
+          resumed.state.active_candidate_id !== expectedActive
+          || resumed.state.active_evaluation?.candidate_id !== expectedActive
+          || resumed.state.open_candidate_id !== null
+          || candidate?.status !== expectedStatus
+        ) throw new ExperimentError('completed H1 runtime conflicts with its durable decision', 'STATE_CORRUPT')
+        this.note(live, `restored runtime from completed H1 decision (${expectedActive})`)
+        return { status: 'completed', detail: 'H1 runtime restored', output: live.output.join('\n') }
+      }
       if (state.phase === 'initializing') {
         this.note(live, 'recovering experiment staging from durable local inputs')
         state = this.completeInitialization(state)
       }
-      this.note(live, recovering ? 'recovering durable Stage 4B experiment' : 'starting Stage 4B H0 experiment')
+      this.note(live, recovering ? 'recovering durable experiment' : `starting ${contract.subject === undefined ? 'H0' : 'H1'} experiment`)
       if (state.phase === 'materialized' || state.phase === 'train') {
-        state = await this.runStageWithRetry(state, 'train', live)
+        state = await this.runStageWithRetry(state, 'train', live, contract)
       }
-      if (state.phase === 'eval') state = await this.runStageWithRetry(state, 'eval', live)
-      if (state.phase === 'registering') state = this.registerBaseline(state, live)
+      if (state.phase === 'eval') state = await this.runStageWithRetry(state, 'eval', live, contract)
+      if (state.phase === 'registering') state = await this.registerResult(state, live, contract, agent)
       if (state.status !== 'succeeded' || state.phase !== 'complete') {
-        throw new ExperimentError('experiment stopped before committing its H0 baseline', 'STATE_CORRUPT')
+        throw new ExperimentError('experiment stopped before committing its evaluation', 'STATE_CORRUPT')
       }
-      this.note(live, 'Stage 4B H0 baseline trained, evaluated, and registered')
-      return { status: 'completed', detail: 'H0 baseline registered', output: live.output.join('\n') }
+      const detail = contract.subject === undefined ? 'H0 baseline registered' : 'H1 evaluation decided'
+      this.note(live, `${contract.subject === undefined ? 'H0 baseline' : 'H1 candidate'} trained, evaluated, and registered`)
+      return { status: 'completed', detail, output: live.output.join('\n') }
     } catch (error) {
+      if (completedCandidateReplay) {
+        this.note(live, `completed H1 runtime reconciliation failed: ${errorMessage(error)}`)
+        return { status: 'failed', detail: errorMessage(error), output: live.output.join('\n') }
+      }
       state = this.ledger.loadState(profileId, runId)
       const attempt = state.attempts.at(-1)
       if (live.abort.signal.aborted) {
@@ -495,7 +630,7 @@ export class ExperimentController {
         ? this.registrationFailureState(state, experimentError)
         : this.failState(state, experimentError, attempt)
       this.ledger.saveState(state)
-      this.note(live, `Stage 4B stopped: ${experimentError.message}`)
+      this.note(live, `experiment stopped: ${experimentError.message}`)
       return { status: 'failed', detail: experimentError.code, output: live.output.join('\n') }
     }
   }
@@ -504,29 +639,30 @@ export class ExperimentController {
     initial: ExperimentState,
     stage: ExperimentStage,
     live: LiveRun,
+    contract: ExperimentContract,
   ): Promise<ExperimentState> {
     let state = initial
     for (;;) {
       let attempt = [...state.attempts].reverse().find(value => value.stage === stage)
       if (attempt?.status === 'succeeded') return state
       if (attempt === undefined || attempt.status === 'failed') {
-        const prepared = this.prepareAttempt(state, stage)
+        const prepared = this.prepareAttempt(state, stage, contract)
         state = this.ledger.saveState(prepared.state)
         attempt = state.attempts.at(-1)
         if (attempt === undefined) throw new ExperimentError('prepared attempt disappeared', 'STATE_CORRUPT', { stage })
       }
       try {
-        const request = this.readAttemptRequest(state, attempt)
-        const spec = this.attemptSpec(state, attempt)
+        const request = this.readAttemptRequest(state, attempt, contract)
+        const spec = this.attemptSpec(state, attempt, contract)
         return ['submitting', 'submitted', 'monitoring'].includes(attempt.status)
-          ? await this.reconcileAndMonitor(state, state.attempts.length - 1, request, spec, live, attempt)
-          : await this.preflightAndSubmit(state, state.attempts.length - 1, request, spec, live, attempt.status)
+          ? await this.reconcileAndMonitor(state, state.attempts.length - 1, request, spec, live, attempt, contract)
+          : await this.preflightAndSubmit(state, state.attempts.length - 1, request, spec, live, attempt.status, contract)
       } catch (error) {
         if (live.abort.signal.aborted) throw error
         const experimentError = asExperimentError(error, 'REMOTE_FAILED', stage)
         state = this.ledger.loadState(state.profile_id, state.run_id)
         const current = state.attempts.at(-1)
-        if (this.canRetryInfrastructure(experimentError, current, stage)) {
+        if (this.canRetryInfrastructure(experimentError, current, stage, contract)) {
           const failed = replaceExperimentAttempt(state, state.attempts.length - 1, {
             status: 'failed',
             failure_code: experimentError.code,
@@ -562,6 +698,7 @@ export class ExperimentController {
     spec: Stage4ARJobSpec,
     live: LiveRun,
     attempt: ExperimentAttempt,
+    contract: ExperimentContract,
   ): Promise<ExperimentState> {
     live.remoteName = attempt.rjob_name
     live.remoteConfirmed = attempt.status !== 'submitting'
@@ -579,15 +716,15 @@ export class ExperimentController {
     if (attempt.status === 'submitting') {
       state = this.updateAttempt(state, attemptIndex, { status: 'submitted' })
     }
-    return this.monitor(state, attemptIndex, request, spec, live, observation.status)
+    return this.monitor(state, attemptIndex, request, spec, live, contract, observation.status)
   }
 
-  private prepareAttempt(state: ExperimentState, stage: ExperimentStage): {
+  private prepareAttempt(state: ExperimentState, stage: ExperimentStage, contract: ExperimentContract): {
     readonly state: ExperimentState
     readonly request: ExperimentTrainRequest | ExperimentEvalRequest
   } {
     const attemptNumber = state.attempts.filter(attempt => attempt.stage === stage).length + 1
-    if (attemptNumber > this.contract.retry.infrastructure_retries_per_stage + 1) {
+    if (attemptNumber > contract.retry.infrastructure_retries_per_stage + 1) {
       throw new ExperimentError(`${stage} exhausted its single infrastructure retry`, 'RECOVERY_REQUIRED', { stage })
     }
     if (attemptNumber === 2) {
@@ -629,8 +766,8 @@ export class ExperimentController {
     const output = outputRoot(state, stage, attemptNumber)
     const request = stage === 'train'
       ? createExperimentTrainRequest({
-        contract: this.contract,
-        contract_sha256: this.contractSha256,
+        contract,
+        contract_sha256: state.contract_sha256,
         profile_id: state.profile_id,
         run_id: state.run_id,
         attempt: attemptNumber,
@@ -642,12 +779,12 @@ export class ExperimentController {
         output_root: output,
       })
       : createExperimentEvalRequest({
-        contract: this.contract,
-        contract_sha256: this.contractSha256,
+        contract,
+        contract_sha256: state.contract_sha256,
         profile_id: state.profile_id,
         run_id: state.run_id,
         attempt: attemptNumber,
-        checkpoint_path: this.trainingCheckpoint(state),
+        checkpoint_path: this.trainingCheckpoint(state, contract),
         output_root: output,
       })
     const requestPath = resolve(stagedDirectory, 'request.json')
@@ -685,6 +822,7 @@ export class ExperimentController {
     spec: Stage4ARJobSpec,
     live: LiveRun,
     resumeFrom: ExperimentAttempt['status'],
+    contract: ExperimentContract,
   ): Promise<ExperimentState> {
     let state = initial
     const local = this.ledger.localAttemptDirectory(state, spec.stage, request.attempt)
@@ -738,7 +876,7 @@ export class ExperimentController {
     this.ledger.writeNewJson(state.run_directory, submissionPath, submission)
     state = this.updateAttempt(state, attemptIndex, { status: 'submitted', submission_path: submissionPath })
     this.note(live, `${spec.stage} submitted as ${spec.rjob_name}`)
-    return this.monitor(state, attemptIndex, request, spec, live)
+    return this.monitor(state, attemptIndex, request, spec, live, contract)
   }
 
   private async monitor(
@@ -747,6 +885,7 @@ export class ExperimentController {
     request: ExperimentTrainRequest | ExperimentEvalRequest,
     spec: Stage4ARJobSpec,
     live: LiveRun,
+    contract: ExperimentContract,
     initialRemoteStatus?: Stage4ARJobObservation['status'],
   ): Promise<ExperimentState> {
     let state = initial
@@ -776,13 +915,13 @@ export class ExperimentController {
             ? normalizeExperimentTrainResult(
               failedResult,
               request as ExperimentTrainRequest,
-              this.contract,
+              contract,
               { allow_failed: true },
             )
             : normalizeExperimentEvalResult(
               failedResult,
               request as ExperimentEvalRequest,
-              this.contract,
+              contract,
               { allow_failed: true },
             )
           if (result.status === 'failed') {
@@ -820,7 +959,7 @@ export class ExperimentController {
     const localResultPath = resolve(local, 'result.json')
     if (spec.stage === 'train') {
       const trainRequest = request as ExperimentTrainRequest
-      const result = normalizeExperimentTrainResult(rawResult, trainRequest, this.contract)
+      const result = normalizeExperimentTrainResult(rawResult, trainRequest, contract)
       this.ledger.requireDirectory(state.staging_directory, result.checkpoint_path, 'training checkpoint')
       this.ledger.writeNewOrSameJson(state.run_directory, localResultPath, result)
       const succeeded = replaceExperimentAttempt(state, attemptIndex, { status: 'succeeded', logs_path: logsPath }, nowIso(this.now))
@@ -833,7 +972,7 @@ export class ExperimentController {
       })
     } else {
       const evalRequest = request as ExperimentEvalRequest
-      const result = normalizeExperimentEvalResult(rawResult, evalRequest, this.contract)
+      const result = normalizeExperimentEvalResult(rawResult, evalRequest, contract)
       const localPredictionsPath = resolve(local, 'predictions.jsonl')
       this.ledger.copyNewOrSame(state.run_directory, result.predictions_path, localPredictionsPath)
       const predictionsStat = lstatSync(localPredictionsPath)
@@ -922,18 +1061,19 @@ export class ExperimentController {
   private readAttemptRequest(
     state: ExperimentState,
     attempt: ExperimentAttempt,
+    contract: ExperimentContract,
   ): ExperimentTrainRequest | ExperimentEvalRequest {
     const value = this.ledger.readJson(state.staging_directory, attempt.request_path, `${attempt.stage} request`)
     const request = attempt.stage === 'train'
-      ? normalizeExperimentTrainRequest(value, this.contract, this.contractSha256)
-      : normalizeExperimentEvalRequest(value, this.contract, this.contractSha256)
+      ? normalizeExperimentTrainRequest(value, contract, state.contract_sha256)
+      : normalizeExperimentEvalRequest(value, contract, state.contract_sha256)
     if (request.profile_id !== state.profile_id || request.run_id !== state.run_id || request.attempt !== attempt.attempt) {
       throw new ExperimentError(`${attempt.stage} request does not match durable state`, 'STATE_CORRUPT', { stage: attempt.stage })
     }
     const expected = attempt.stage === 'train'
       ? createExperimentTrainRequest({
-        contract: this.contract,
-        contract_sha256: this.contractSha256,
+        contract,
+        contract_sha256: state.contract_sha256,
         profile_id: state.profile_id,
         run_id: state.run_id,
         attempt: attempt.attempt,
@@ -945,12 +1085,12 @@ export class ExperimentController {
         output_root: outputRoot(state, 'train', attempt.attempt),
       })
       : createExperimentEvalRequest({
-        contract: this.contract,
-        contract_sha256: this.contractSha256,
+        contract,
+        contract_sha256: state.contract_sha256,
         profile_id: state.profile_id,
         run_id: state.run_id,
         attempt: attempt.attempt,
-        checkpoint_path: this.trainingCheckpoint(state),
+        checkpoint_path: this.trainingCheckpoint(state, contract),
         output_root: outputRoot(state, 'eval', attempt.attempt),
       })
     if (canonicalJson(request) !== canonicalJson(expected)) {
@@ -959,15 +1099,15 @@ export class ExperimentController {
     return request
   }
 
-  private trainingCheckpoint(state: ExperimentState): string {
+  private trainingCheckpoint(state: ExperimentState, contract: ExperimentContract): string {
     const attempt = [...state.attempts].reverse().find(value => value.stage === 'train' && value.status === 'succeeded')
     if (attempt === undefined || state.train_result_path === undefined) {
       throw new ExperimentError('evaluation requires a validated training result', 'STATE_CORRUPT', { stage: 'eval' })
     }
-    return resolve(outputRoot(state, 'train', attempt.attempt), 'train', `checkpoint-${String(this.contract.training.max_steps)}`)
+    return resolve(outputRoot(state, 'train', attempt.attempt), 'train', `checkpoint-${String(contract.training.max_steps)}`)
   }
 
-  private attemptSpec(state: ExperimentState, attempt: ExperimentAttempt): Stage4ARJobSpec {
+  private attemptSpec(state: ExperimentState, attempt: ExperimentAttempt, contract: ExperimentContract): Stage4ARJobSpec {
     return Object.freeze({
       stage: attempt.stage,
       rjob_name: attempt.rjob_name,
@@ -978,11 +1118,11 @@ export class ExperimentController {
       // The H-cluster rejects zero. A platform replay cannot repeat scientific
       // work because each worker creates its attempt output root exclusively;
       // only the Controller may clean that root and create formal attempt 2.
-      backoff_limit: this.contract.execution.rjob_backoff_limit,
-      container_image: this.contract.execution.container_image,
+      backoff_limit: contract.execution.rjob_backoff_limit,
+      container_image: contract.execution.container_image,
       resources: attempt.stage === 'train'
-        ? { gpu: this.contract.training.gpus, cpu: 64, memory_mib: 327_680 }
-        : { gpu: this.contract.evaluation.gpus, cpu: 16, memory_mib: 81_920 },
+        ? { gpu: contract.training.gpus, cpu: 64, memory_mib: 327_680 }
+        : { gpu: contract.evaluation.gpus, cpu: 16, memory_mib: 81_920 },
     })
   }
 
@@ -1001,7 +1141,7 @@ export class ExperimentController {
     for (const name of ['canonical.jsonl', 'logical-view.jsonl', 'run-summary.json', 'experiment-contract.json'] as const) {
       this.ledger.copyNewOrSame(state.staging_directory, resolve(state.run_directory, name), resolve(state.staging_directory, name))
     }
-    for (const name of STAGE4B_FILES) {
+    for (const name of EXPERIMENT_FILES) {
       this.ledger.copyNewOrSame(state.staging_directory, assertSourceFile(this.assetRoot, name), resolve(state.staging_directory, name))
     }
     for (const name of COMMON_WORKER_FILES) {
@@ -1019,15 +1159,23 @@ export class ExperimentController {
     return this.ledger.saveState(materialized)
   }
 
-  private registerBaseline(state: ExperimentState, live: LiveRun): ExperimentState {
-    if (state.eval_result_path === undefined) throw new ExperimentError('baseline registration requires an evaluation result', 'STATE_CORRUPT')
-    const attempt = [...state.attempts].reverse().find(value => value.stage === 'eval' && value.status === 'succeeded')
-    if (attempt === undefined) throw new ExperimentError('baseline registration requires a successful evaluation attempt', 'STATE_CORRUPT')
-    const request = this.readAttemptRequest(state, attempt) as ExperimentEvalRequest
-    const raw = this.ledger.readJson(state.run_directory, state.eval_result_path, 'durable evaluation result')
-    const result = normalizeExperimentEvalResult(raw, request, this.contract)
-    const localPredictionsPath = resolve(this.ledger.localAttemptDirectory(state, 'eval', attempt.attempt), 'predictions.jsonl')
-    assertSourceFile(state.run_directory, relative(state.run_directory, localPredictionsPath))
+  private async registerResult(
+    state: ExperimentState,
+    live: LiveRun,
+    contract: ExperimentContract,
+    agent?: ExperimentRuntimeAgent,
+  ): Promise<ExperimentState> {
+    return contract.subject === undefined
+      ? this.registerBaseline(state, live, contract)
+      : this.registerCandidateEvaluation(state, live, contract, agent)
+  }
+
+  private registerBaseline(state: ExperimentState, live: LiveRun, contract: ExperimentContract): ExperimentState {
+    const result = this.readValidatedEvaluation(state, contract)
+    const evaluationResultPath = state.eval_result_path
+    if (evaluationResultPath === undefined) {
+      throw new ExperimentError('baseline registration requires a durable evaluation result', 'STATE_CORRUPT')
+    }
     const { feedbackId, reportId } = this.baselineIds(state)
     const searchCases = result.cases.filter(value => value.split === 'B_search')
     const searchArtifactPath = resolve(state.run_directory, 'b-search-results.json')
@@ -1046,7 +1194,7 @@ export class ExperimentController {
       feedback_id: feedbackId,
       profile_id: state.profile_id,
       candidate_id: H0_CANDIDATE_ID,
-      benchmark: this.contract.profile.benchmark,
+      benchmark: contract.profile.benchmark,
       split: 'B_search',
       summary: `H0 completed ${String(searchCases.length)} B_search cases; macro ${String(result.macro_scores.B_search)}`,
       failures: searchCases.filter(value => !value.passed).map(value => ({
@@ -1072,19 +1220,19 @@ export class ExperimentController {
       report_id: reportId,
       profile_id: state.profile_id,
       candidate_id: H0_CANDIDATE_ID,
-      benchmark: this.contract.profile.benchmark,
+      benchmark: contract.profile.benchmark,
       split: 'B_dev',
-      metric: this.contract.profile.metric,
+      metric: contract.profile.metric,
       score: result.macro_scores.B_dev,
       complete: true,
       cases_evaluated: devCases.length,
-      cases_expected: this.contract.evaluation.categories.length * this.contract.evaluation.cases_per_category_per_split,
+      cases_expected: contract.evaluation.categories.length * contract.evaluation.cases_per_category_per_split,
       run_id: state.run_id,
       category_scores: result.category_scores.B_dev,
       metadata: {
         contract_id: state.contract_id,
         contract_sha256: state.contract_sha256,
-        evaluation_result_path: state.eval_result_path,
+        evaluation_result_path: evaluationResultPath,
       },
     }
     this.ledger.writeNewOrSameJson(state.run_directory, resolve(state.run_directory, 'feedback.json'), feedback)
@@ -1116,6 +1264,103 @@ export class ExperimentController {
     return this.ledger.saveState(complete)
   }
 
+  private async registerCandidateEvaluation(
+    state: ExperimentState,
+    live: LiveRun,
+    contract: ExperimentContract,
+    agent?: ExperimentRuntimeAgent,
+  ): Promise<ExperimentState> {
+    const subject = contract.subject
+    if (subject === undefined || state.candidate_id !== subject.candidate_id || agent === undefined) {
+      throw new ExperimentError('H1 evaluation registration requires its frozen candidate and runtime Agent', 'STATE_CORRUPT')
+    }
+    const result = this.readValidatedEvaluation(state, contract)
+    const evaluationResultPath = state.eval_result_path
+    if (evaluationResultPath === undefined) {
+      throw new ExperimentError('candidate registration requires a durable evaluation result', 'STATE_CORRUPT')
+    }
+    const snapshot = this.options.evolution.store.loadConsistentSnapshot(state.profile_id)
+    // Stage 4C is pre-registered against H0, not whichever candidate happens
+    // to be active when an idempotent replay reaches this point. In the crash
+    // window after recordEvaluation() commits an accepted H1 but before the
+    // experiment ledger stores its decision, active_evaluation already points
+    // at H1. The immutable H0 candidate summary remains the comparison anchor.
+    const baseline = snapshot.state.candidates
+      .find(candidate => candidate.candidate_id === H0_CANDIDATE_ID)?.evaluation
+    if (
+      baseline === undefined
+      || baseline.candidate_id !== H0_CANDIDATE_ID
+      || baseline.benchmark !== contract.profile.benchmark
+      || baseline.split !== 'B_dev'
+      || baseline.metric !== contract.profile.metric
+    ) {
+      throw new ExperimentError('candidate evaluation requires the durable H0 B_dev baseline', 'EVALUATION_REGISTRATION_FAILED')
+    }
+    const { reportId } = this.candidateIds(state)
+    const searchCases = result.cases.filter(value => value.split === 'B_search')
+    const searchArtifactPath = resolve(state.run_directory, 'b-search-results.json')
+    this.ledger.writeNewOrSameJson(state.run_directory, searchArtifactPath, {
+      schema_version: 'autodata-b-search-results-1',
+      contract_id: state.contract_id,
+      contract_sha256: state.contract_sha256,
+      profile_id: state.profile_id,
+      run_id: state.run_id,
+      candidate_id: subject.candidate_id,
+      cases: searchCases,
+      category_scores: result.category_scores.B_search,
+      macro_score: result.macro_scores.B_search,
+    })
+    const devCases = result.cases.filter(value => value.split === 'B_dev')
+    const report: EvaluationReport = {
+      schema_version: EVALUATION_REPORT_SCHEMA_VERSION,
+      report_id: reportId,
+      profile_id: state.profile_id,
+      candidate_id: subject.candidate_id,
+      benchmark: contract.profile.benchmark,
+      split: 'B_dev',
+      metric: contract.profile.metric,
+      score: result.macro_scores.B_dev,
+      complete: true,
+      cases_evaluated: devCases.length,
+      cases_expected: contract.evaluation.categories.length * contract.evaluation.cases_per_category_per_split,
+      run_id: state.run_id,
+      baseline_candidate_id: baseline.candidate_id,
+      baseline_score: baseline.score,
+      category_scores: result.category_scores.B_dev,
+      metadata: {
+        contract_id: state.contract_id,
+        contract_sha256: state.contract_sha256,
+        evaluation_result_path: evaluationResultPath,
+        b_search_artifact_path: searchArtifactPath,
+      },
+    }
+    const reportPath = resolve(state.run_directory, 'evaluation-report.json')
+    const decisionPath = resolve(state.run_directory, 'decision.json')
+    this.ledger.writeNewOrSameJson(state.run_directory, reportPath, report)
+    try {
+      const outcome = await this.options.evolution.recordEvaluation(report, agent)
+      this.ledger.writeNewOrSameJson(state.run_directory, decisionPath, outcome.decision)
+      const complete = normalizeExperimentState({
+        ...state,
+        status: 'succeeded',
+        phase: 'complete',
+        evaluation_report_id: reportId,
+        decision_path: decisionPath,
+        decision: outcome.decision,
+        updated_at: nowIso(this.now),
+        failure: undefined,
+      })
+      this.note(live, `B_dev H1 evaluation durably decided: ${outcome.decision.reason}`)
+      return this.ledger.saveState(complete)
+    } catch (error) {
+      throw new ExperimentError(
+        `cannot register the H1 evaluation: ${errorMessage(error)}`,
+        'EVALUATION_REGISTRATION_FAILED',
+        { cause: error },
+      )
+    }
+  }
+
   private ensureFeedback(feedback: EvolutionFeedback): void {
     const snapshot = this.options.evolution.store.loadConsistentSnapshot(feedback.profile_id)
     const referenced = snapshot.feedback_records.find(value => value.feedback_id === feedback.feedback_id)
@@ -1142,23 +1387,67 @@ export class ExperimentController {
     return { feedbackId: `h0-search-${suffix}`, reportId: `h0-dev-${suffix}` }
   }
 
+  private candidateIds(state: ExperimentState): { readonly reportId: string } {
+    const suffix = sha256(`${state.contract_sha256}\0${state.profile_id}\0${state.run_id}\0${state.candidate_id ?? ''}`).slice(0, 20)
+    return { reportId: `h1-dev-${suffix}` }
+  }
+
   private assertProfile(
     profileId: string,
     allowRegisteredBaseline: boolean,
     registrationState?: ExperimentState,
-  ): void {
-    if (profileId !== this.contract.profile.id) {
-      throw new ExperimentError(`profile_id must equal frozen contract profile ${this.contract.profile.id}`, 'INVALID_REQUEST')
+    subject?: ExperimentCandidateSubject,
+  ): FrozenSelectionRuntimeBinding | undefined {
+    if (profileId !== this.baselineContract.profile.id) {
+      throw new ExperimentError(`profile_id must equal frozen contract profile ${this.baselineContract.profile.id}`, 'INVALID_REQUEST')
     }
     let status
     try { status = this.options.evolution.status(profileId) } catch (error) {
       throw new ExperimentError(`cannot load TaskProfile ${profileId}: ${errorMessage(error)}`, 'INVALID_REQUEST', { cause: error })
     }
     if (
-      status.profile.benchmark !== this.contract.profile.benchmark
-      || status.profile.acceptance_policy.metric !== this.contract.profile.metric
+      status.profile.benchmark !== this.baselineContract.profile.benchmark
+      || status.profile.acceptance_policy.metric !== this.baselineContract.profile.metric
       || status.profile.acceptance_policy.split !== 'B_dev'
     ) throw new ExperimentError('TaskProfile does not match the frozen experiment contract', 'INVALID_REQUEST')
+    if (subject !== undefined) {
+      const snapshot = this.options.evolution.store.loadConsistentSnapshot(profileId)
+      const candidate = snapshot.state.candidates.find(value => value.candidate_id === subject.candidate_id)
+      const candidatePackage = snapshot.candidate_packages.find(value => value.manifest.candidate_id === subject.candidate_id)
+      let runtimeBinding
+      try {
+        runtimeBinding = candidatePackage === undefined
+          ? null
+          : candidateFrozenSelectionRuntimeBinding(status.profile, candidatePackage)
+      } catch (error) {
+        throw new ExperimentError('H1 subject candidate has an invalid frozen runtime binding', 'INVALID_REQUEST', {
+          cause: error,
+        })
+      }
+      if (
+        candidatePackage === undefined
+        || runtimeBinding === null
+        || candidatePackage.manifest.generation !== subject.generation
+        || candidatePackage.manifest.strategy_version !== subject.strategy_version
+        || status.profile.strategy_plugin_id !== subject.plugin_id
+        || sha256(candidatePackage.host_source) !== subject.host_source_sha256
+        || runtimeBinding.runtime_plan_sha256 !== subject.runtime_plan_sha256
+        || runtimeBinding.materialization_sha256 !== subject.materialization_sha256
+      ) throw new ExperimentError('H1 subject does not match the durable candidate package', 'INVALID_REQUEST')
+      const expectedReportId = registrationState === undefined
+        ? undefined
+        : this.candidateIds(registrationState).reportId
+      const committed = registrationState?.phase === 'registering'
+        && candidate?.evaluation?.report_id === expectedReportId
+      if (!committed && (
+        snapshot.state.active_candidate_id !== H0_CANDIDATE_ID
+        || snapshot.state.active_evaluation?.candidate_id !== H0_CANDIDATE_ID
+        || snapshot.state.open_candidate_id !== subject.candidate_id
+        || candidate?.status !== 'validated'
+        || candidate?.parent_candidate_id !== H0_CANDIDATE_ID
+      )) throw new ExperimentError('H1 experiment requires the single validated open child of H0', 'INVALID_REQUEST')
+      return runtimeBinding
+    }
     if (status.state.active_candidate_id !== H0_CANDIDATE_ID || status.state.open_candidate_id !== null) {
       const expectedReportId = registrationState === undefined
         ? undefined
@@ -1174,19 +1463,128 @@ export class ExperimentController {
     if (!allowRegisteredBaseline && status.state.active_evaluation !== undefined) {
       throw new ExperimentError('the TaskProfile already has a registered H0 baseline', 'INVALID_REQUEST')
     }
+    return undefined
   }
 
-  private assertContractBinding(state: ExperimentState): void {
-    if (state.contract_id !== this.contract.contract_id || state.contract_sha256 !== this.contractSha256) {
-      throw new ExperimentError('experiment state is bound to a different contract', 'STATE_CORRUPT')
+  /** Prove that the H1 training payload is the exact materialization named by the candidate binding. */
+  private assertCandidateMaterializationBinding(
+    subject: ExperimentCandidateSubject,
+    binding: FrozenSelectionRuntimeBinding,
+    serialized: ReturnType<typeof serializeDataRun>,
+  ): void {
+    const hashes = experimentArtifactHashes(serialized.files)
+    const materialization = {
+      schema_version: GENERATION_MATERIALIZATION_VERSION,
+      candidate_id: subject.candidate_id,
+      host_source_sha256: subject.host_source_sha256,
+      source_pool_sha256: hashes['canonical.jsonl'],
+      canonical_jsonl_sha256: hashes['canonical.jsonl'],
+      logical_view_jsonl_sha256: hashes['logical-view.jsonl'],
+      run_summary_json_sha256: hashes['run-summary.json'],
+      selected_record_ids: binding.decisions.map(decision => decision.record_id),
+      data_run: serialized.data,
     }
+    if (
+      binding.source_pool_sha256 !== hashes['canonical.jsonl']
+      || sha256(canonicalJson(materialization)) !== binding.materialization_sha256
+    ) {
+      throw new ExperimentError(
+        'H1 data_run does not match the candidate frozen materialization',
+        'INVALID_REQUEST',
+      )
+    }
+  }
+
+  private assertContractBinding(state: ExperimentState): ExperimentContract {
     const localContract = resolve(state.run_directory, 'experiment-contract.json')
-    let localHash: string
-    try { localHash = sha256(readFileSync(localContract)) } catch (error) {
+    let loaded: ReturnType<typeof loadExperimentContract>
+    try { loaded = loadExperimentContract(localContract) } catch (error) {
       throw new ExperimentError('durable experiment contract is missing', 'STATE_CORRUPT', { cause: error })
     }
-    if (localHash !== state.contract_sha256) throw new ExperimentError('durable experiment contract hash changed', 'STATE_CORRUPT')
-    if (state.status === 'succeeded') this.assertRegisteredBaseline(state)
+    if (loaded.sha256 !== state.contract_sha256 || loaded.contract.contract_id !== state.contract_id) {
+      throw new ExperimentError('durable experiment contract binding changed', 'STATE_CORRUPT')
+    }
+    const contract = loaded.contract
+    if (contract.subject === undefined) {
+      if (
+        state.candidate_id !== undefined
+        || state.contract_sha256 !== this.baselineContractSha256
+        || canonicalJson(contract) !== canonicalJson(this.baselineContract)
+      ) throw new ExperimentError('H0 state is not bound to the checked-in baseline contract', 'STATE_CORRUPT')
+    } else if (
+      state.candidate_id !== contract.subject.candidate_id
+      || state.candidate_generation !== contract.subject.generation
+      || canonicalJson(contract.profile) !== canonicalJson(this.baselineContract.profile)
+      || canonicalJson(contract.model) !== canonicalJson(this.baselineContract.model)
+      || canonicalJson(contract.execution) !== canonicalJson(this.baselineContract.execution)
+      || canonicalJson(contract.training) !== canonicalJson(this.baselineContract.training)
+      || canonicalJson(contract.evaluation) !== canonicalJson(this.baselineContract.evaluation)
+      || canonicalJson(contract.retry) !== canonicalJson(this.baselineContract.retry)
+      || contract.data.dataset_id !== this.baselineContract.data.dataset_id
+      || contract.data.dataset_subset !== this.baselineContract.data.dataset_subset
+      || contract.data.dataset_revision !== this.baselineContract.data.dataset_revision
+      || contract.data.seed !== this.baselineContract.data.seed
+      || contract.data.canonical_records !== this.baselineContract.data.canonical_records
+      || contract.data.historical_training_tokens !== this.baselineContract.data.historical_training_tokens
+      || contract.data.canonical_jsonl_sha256 !== this.baselineContract.data.canonical_jsonl_sha256
+    ) throw new ExperimentError('H1 contract does not preserve the frozen H0 protocol and source pool', 'STATE_CORRUPT')
+    if (state.status === 'succeeded') {
+      this.readValidatedEvaluation(state, contract)
+      if (contract.subject === undefined) this.assertRegisteredBaseline(state)
+      else this.assertRegisteredCandidate(state, contract)
+    }
+    return contract
+  }
+
+  /** Revalidate the durable result and its exact 50-case prediction sidecar on every registration/replay. */
+  private readValidatedEvaluation(
+    state: ExperimentState,
+    contract: ExperimentContract,
+  ): ExperimentEvalResult {
+    if (state.eval_result_path === undefined) {
+      throw new ExperimentError('evaluation registration requires a durable result', 'STATE_CORRUPT')
+    }
+    const attempt = [...state.attempts].reverse().find(value =>
+      value.stage === 'eval' && value.status === 'succeeded')
+    if (attempt === undefined) {
+      throw new ExperimentError('evaluation registration requires a successful evaluation attempt', 'STATE_CORRUPT')
+    }
+    const expectedResultPath = resolve(
+      this.ledger.localAttemptDirectory(state, 'eval', attempt.attempt),
+      'result.json',
+    )
+    if (state.eval_result_path !== expectedResultPath) {
+      throw new ExperimentError('durable evaluation result path does not match its successful attempt', 'STATE_CORRUPT')
+    }
+    const request = this.readAttemptRequest(state, attempt, contract) as ExperimentEvalRequest
+    const raw = this.ledger.readJson(state.run_directory, state.eval_result_path, 'durable evaluation result')
+    const result = normalizeExperimentEvalResult(raw, request, contract)
+    const predictionsPath = assertSourceFile(
+      state.run_directory,
+      relative(
+        state.run_directory,
+        resolve(this.ledger.localAttemptDirectory(state, 'eval', attempt.attempt), 'predictions.jsonl'),
+      ),
+    )
+    const predictionsStat = lstatSync(predictionsPath)
+    if (predictionsStat.size > PREDICTIONS_LIMIT_BYTES) {
+      throw new ExperimentError(
+        'evaluation predictions must be no larger than 16 MiB',
+        'ARTIFACT_INVALID',
+        { stage: 'eval' },
+      )
+    }
+    let predictionsText: string
+    try {
+      predictionsText = readFileSync(predictionsPath, 'utf8')
+    } catch (error) {
+      throw new ExperimentError('cannot read durable evaluation predictions', 'ARTIFACT_INVALID', {
+        stage: 'eval',
+        cause: error,
+      })
+    }
+    normalizeExperimentPredictionsJsonl(predictionsText, result.cases)
+    return result
   }
 
   private assertRegisteredBaseline(state: ExperimentState): void {
@@ -1232,16 +1630,56 @@ export class ExperimentController {
     }
   }
 
+  private assertRegisteredCandidate(state: ExperimentState, contract: ExperimentContract): void {
+    if (
+      contract.subject === undefined
+      || state.evaluation_report_id === undefined
+      || state.decision === undefined
+      || state.decision_path === undefined
+      || state.feedback_id !== undefined
+    ) throw new ExperimentError('completed H1 experiment is missing its decision identifiers', 'STATE_CORRUPT')
+    try {
+      const localReport = normalizeEvaluationReport(this.ledger.readJson(
+        state.run_directory,
+        resolve(state.run_directory, 'evaluation-report.json'),
+        'durable H1 B_dev evaluation report',
+      ) as EvaluationReport)
+      const localDecision = this.ledger.readJson(state.run_directory, state.decision_path, 'durable H1 decision')
+      const snapshot = this.options.evolution.store.loadConsistentSnapshot(state.profile_id)
+      const stored = snapshot.evaluation_records.find(value => value.report.report_id === state.evaluation_report_id)
+      const candidate = snapshot.state.candidates.find(value => value.candidate_id === contract.subject?.candidate_id)
+      if (
+        localReport.report_id !== state.evaluation_report_id
+        || localReport.profile_id !== state.profile_id
+        || localReport.candidate_id !== contract.subject.candidate_id
+        || localReport.run_id !== state.run_id
+        || canonicalJson(localDecision) !== canonicalJson(state.decision)
+        || stored?.decision === undefined
+        || canonicalJson(stored.report) !== canonicalJson(localReport)
+        || canonicalJson(stored.decision) !== canonicalJson(state.decision)
+        || candidate?.evaluation?.report_id !== state.evaluation_report_id
+      ) throw new Error('Evolution store does not contain the committed H1 evaluation decision')
+    } catch (error) {
+      if (error instanceof ExperimentError && error.code === 'STATE_CORRUPT') throw error
+      throw new ExperimentError(
+        `completed candidate experiment is inconsistent: ${errorMessage(error)}`,
+        'STATE_CORRUPT',
+        { profile_id: state.profile_id, run_id: state.run_id, cause: error },
+      )
+    }
+  }
+
   private canRetryInfrastructure(
     error: ExperimentError,
     attempt: ExperimentAttempt | undefined,
     stage: ExperimentStage,
+    contract: ExperimentContract,
   ): boolean {
     return attempt?.stage === stage
       && attempt.attempt === 1
       && !['submitting', 'succeeded', 'cancelled'].includes(attempt.status)
       && RETRYABLE_INFRASTRUCTURE_ERRORS.has(error.code)
-      && this.contract.retry.infrastructure_retries_per_stage === 1
+      && contract.retry.infrastructure_retries_per_stage === 1
   }
 
   private async reconcileCancellation(
@@ -1323,11 +1761,14 @@ export class ExperimentController {
   }
 
   private registrationFailureState(state: ExperimentState, error: ExperimentError): ExperimentState {
+    const code = error.code === 'EVALUATION_REGISTRATION_FAILED'
+      ? 'EVALUATION_REGISTRATION_FAILED'
+      : 'BASELINE_REGISTRATION_FAILED'
     return normalizeExperimentState({
       ...state,
       status: 'recovery_required',
       updated_at: nowIso(this.now),
-      failure: { code: 'BASELINE_REGISTRATION_FAILED', message: error.message },
+      failure: { code, message: error.message },
     })
   }
 
