@@ -127,6 +127,12 @@ export class GenerationController {
     this.pollIntervalMs = options.poll_interval_ms ?? DEFAULT_POLL_INTERVAL_MS
     this.now = options.now ?? (() => new Date())
     this.sleep = options.sleep ?? sleepWithAbort
+    if (
+      options.expected_proposal_context_sha256 !== undefined
+      && !/^[a-f0-9]{64}$/u.test(options.expected_proposal_context_sha256)
+    ) {
+      throw new GenerationError('expected_proposal_context_sha256 must be a lowercase SHA-256', 'INVALID_REQUEST')
+    }
     if (!Number.isFinite(this.pollIntervalMs) || this.pollIntervalMs < 0) {
       throw new GenerationError('poll_interval_ms must be a finite non-negative number', 'INVALID_REQUEST')
     }
@@ -147,7 +153,8 @@ export class GenerationController {
       now: nowIso(this.now),
     })
     // Validate all immutable H0 inputs before consuming the one formal run ID.
-    this.loadFrozenInputs(state)
+    const frozen = this.loadFrozenInputs(state)
+    this.assertExpectedProposalContext(frozen.proposalContext)
     this.ledger.claimFirstH1(state)
     this.ledger.initialize(state, { 'request.json': `${canonicalJson(request)}\n` })
     return this.launch(state, false)
@@ -289,6 +296,7 @@ export class GenerationController {
       if (!state.formal_candidate_persisted) {
         if (state.phase === 'initialized' || state.phase === 'proposing') {
           const frozen = this.loadFrozenInputs(state)
+          this.assertExpectedProposalContext(frozen.proposalContext)
           this.ledger.writeNewOrSameJson(resolve(state.run_directory, 'proposal-context.json'), frozen.proposalContext, state.run_directory)
           this.ledger.writeNewOrSameJson(resolve(state.run_directory, 'source-lineage.json'), {
             schema_version: 'autodata-generation-lineage-1',
@@ -817,6 +825,7 @@ export class GenerationController {
       })) throw new GenerationError('completed generation request no longer matches its state', 'ARTIFACT_INVALID')
 
       const frozen = this.loadFrozenInputs(state, true)
+      this.assertExpectedProposalContext(frozen.proposalContext)
       const proposalContext = this.readJsonContained(
         resolve(state.run_directory, 'proposal-context.json'),
         state.run_directory,
@@ -1289,6 +1298,18 @@ export class GenerationController {
       sourcePoolSha256,
       baselineFeedbackId: feedback.feedback_id,
     })
+  }
+
+  private assertExpectedProposalContext(context: GenerationProposalContext): void {
+    const expected = this.options.expected_proposal_context_sha256
+    if (expected === undefined) return
+    const actual = sha256(`${canonicalJson(context)}\n`)
+    if (actual !== expected) {
+      throw new GenerationError(
+        'recomputed proposal context differs from the protocol-bound context',
+        'ARTIFACT_INVALID',
+      )
+    }
   }
 
   private candidatePackage(state: GenerationState, draft: GenerationDraft): CandidatePackage {

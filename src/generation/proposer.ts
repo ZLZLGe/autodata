@@ -10,9 +10,10 @@ import {
   type GenerationProposer,
 } from './types.js'
 
-export const GENERATION_PROVIDER = 'free-router'
-export const GENERATION_MODEL = 'gpt-5.6-sol'
+export const GENERATION_PROVIDER = 'pjlab'
+export const GENERATION_MODEL = 'glm-5.3-flash'
 const DEFAULT_MAX_TOKENS = 16_384
+const MAX_PROVIDER_DIAGNOSTIC_CHARS = 1_000
 
 interface DshAgentHandle {
   readonly agent: EvolutionRuntimeAgent & {
@@ -74,32 +75,38 @@ export class DshGenerationProposer implements GenerationProposer {
       throw new GenerationError('DSH Agent message runtime is unavailable', 'DEPENDENCY_UNAVAILABLE', { cause: error })
     }
     const sessionId = SessionId(`autodata-generation-${profileId}-${runId}`)
-    const handle = await registry.create({
-      sessionId,
-      agentOptions: {
-        provider: this.provider,
-        model: this.model,
-        maxTokens: this.maxTokens,
-      },
-      setup: agentContext => {
-        // The proposal turn is deliberately tool-free. It receives only the
-        // frozen B_search evidence embedded by the Host below.
-        const tools = agentContext.get('tools', false) as {
-          schemas(scope?: unknown): readonly { readonly name: string }[]
-          restrict(filter: { readonly deny: readonly string[] }): () => void
-        } | undefined
-        const names = tools?.schemas().map(schema => schema.name) ?? []
-        if (names.length > 0) tools?.restrict({ deny: names })
-        const prompt = agentContext.get('systemPrompt', false) as {
-          section(value: { readonly name: string; readonly order: number; readonly text: string }): () => void
-        } | undefined
-        prompt?.section({
-          name: 'autodata:generation',
-          order: 1,
-          text: 'You are the AutoData Evolver. Produce only the requested strict JSON object. Never call tools and never reveal or infer B_dev/B_test information.',
-        })
-      },
-    })
+    let handle: DshAgentHandle
+    try {
+      handle = await registry.create({
+        sessionId,
+        agentOptions: {
+          provider: this.provider,
+          model: this.model,
+          maxTokens: this.maxTokens,
+        },
+        setup: agentContext => {
+          // The proposal turn is deliberately tool-free. It receives only the
+          // frozen B_search evidence embedded by the Host below.
+          const tools = agentContext.get('tools', false) as {
+            schemas(scope?: unknown): readonly { readonly name: string }[]
+            restrict(filter: { readonly deny: readonly string[] }): () => void
+          } | undefined
+          const names = tools?.schemas().map(schema => schema.name) ?? []
+          if (names.length > 0) tools?.restrict({ deny: names })
+          const prompt = agentContext.get('systemPrompt', false) as {
+            section(value: { readonly name: string; readonly order: number; readonly text: string }): () => void
+          } | undefined
+          prompt?.section({
+            name: 'autodata:generation',
+            order: 1,
+            text: 'You are the AutoData Evolver. Produce only the requested strict JSON object. Never call tools and never reveal or infer B_dev/B_test information.',
+          })
+        },
+      })
+    } catch (error) {
+      if (signal.aborted) throw new GenerationError('candidate proposal was cancelled', 'CANCEL_FAILED')
+      throw providerBoundaryError('proposal Agent creation failed', error)
+    }
     return new DshProposalSession(handle, createUserMessage)
   }
 }
@@ -124,11 +131,16 @@ class DshProposalSession implements GenerationProposalSession {
     const abort = () => this.handle.agent.cancel({ kind: 'hook', reason: 'AutoData generation cancelled' })
     signal.addEventListener('abort', abort, { once: true })
     try {
-      this.handle.agent.followup(this.createUserMessage({
-        content: [{ type: 'text', text: prompt }],
-        source: { kind: 'user' },
-      }))
-      await this.handle.agent.whenIdle()
+      try {
+        this.handle.agent.followup(this.createUserMessage({
+          content: [{ type: 'text', text: prompt }],
+          source: { kind: 'user' },
+        }))
+        await this.handle.agent.whenIdle()
+      } catch (error) {
+        if (signal.aborted) throw new GenerationError('candidate proposal was cancelled', 'CANCEL_FAILED')
+        throw providerBoundaryError('proposal Agent turn failed', error)
+      }
     } finally {
       signal.removeEventListener('abort', abort)
     }
@@ -170,7 +182,11 @@ function parseAgentDraft(events: readonly unknown[]): GenerationDraft {
   const eventObjects = events.filter(isJsonObject)
   const turnEnd = [...eventObjects].reverse().find(event => event.type === 'turn/end')
   if (!isJsonObject(turnEnd) || !isJsonObject(turnEnd.data) || !isJsonObject(turnEnd.data.reason) || turnEnd.data.reason.kind !== 'completed') {
-    throw new GenerationError('proposal Agent turn did not complete', 'PROPOSAL_FAILED')
+    const reason = isJsonObject(turnEnd) && isJsonObject(turnEnd.data) ? turnEnd.data.reason : undefined
+    throw new GenerationError(
+      `proposal Agent turn did not complete (${formatProposalTurnEndFailure(reason)})`,
+      'PROPOSAL_FAILED',
+    )
   }
   const turn = turnEnd.data.turn
   if (eventObjects.some(event => event.type === 'tool/call' && isJsonObject(event.data) && event.data.turn === turn)) {
@@ -209,4 +225,82 @@ function parseAgentDraft(events: readonly unknown[]): GenerationDraft {
     throw new GenerationError('proposal Agent description must contain 1-2000 characters', 'PROPOSAL_FAILED')
   }
   return Object.freeze({ host_source: value.host_source, description: value.description })
+}
+
+/** Render only the bounded, credential-redacted reason needed to diagnose a failed proposal turn. */
+export function formatProposalTurnEndFailure(
+  reason: unknown,
+  sensitiveValues: readonly string[] = providerDiagnosticSecrets(),
+): string {
+  if (!isJsonObject(reason) || typeof reason.kind !== 'string' || reason.kind.length === 0) return 'kind=missing'
+  const kind = safeDiagnosticToken(reason.kind, sensitiveValues)
+  if (reason.kind !== 'error') return `kind=${kind}`
+  const failure = isJsonObject(reason.error) ? reason.error : undefined
+  const code = typeof failure?.code === 'string' ? safeDiagnosticToken(failure.code, sensitiveValues) : 'UNKNOWN'
+  const message = typeof failure?.message === 'string' && failure.message.length > 0
+    ? sanitizeProviderDiagnostic(failure.message, sensitiveValues)
+    : 'LLM request failed without a message'
+  return `kind=error, code=${code}, message=${message}`
+}
+
+function safeDiagnosticToken(value: string, sensitiveValues: readonly string[]): string {
+  const sanitized = sanitizeProviderDiagnostic(value, sensitiveValues)
+  if (sanitized.includes('[REDACTED]')) return 'REDACTED'
+  return /^[a-z0-9_.-]{1,64}$/iu.test(sanitized) ? sanitized : 'UNKNOWN'
+}
+
+function providerBoundaryError(stage: string, error: unknown): GenerationError {
+  const failure = typeof error === 'object' && error !== null ? error as Record<string, unknown> : undefined
+  const code = typeof failure?.code === 'string' ? failure.code : 'UNKNOWN'
+  const message = error instanceof Error
+    ? error.message
+    : typeof failure?.message === 'string'
+      ? failure.message
+      : 'LLM request failed without a message'
+  return new GenerationError(
+    `${stage} (${formatProposalTurnEndFailure({ kind: 'error', error: { code, message } })})`,
+    'PROPOSAL_FAILED',
+  )
+}
+
+function sanitizeProviderDiagnostic(value: string, sensitiveValues: readonly string[]): string {
+  let sanitized = value
+  for (const secret of [...new Set(sensitiveValues)].filter(secret => secret.length >= 8).sort((a, b) => b.length - a.length)) {
+    sanitized = sanitized.split(secret).join('[REDACTED]')
+  }
+  sanitized = sanitized
+    .replace(/((?:"|')?(?:x[-_]?api[-_]?key|api[_-]?key|authorization|access[_-]?token|token)(?:"|')?\s*[:=]\s*)(?:Bearer\s+)?(?:"[^"]*"|'[^']*'|[^\s,;}]*)/giu, '$1[REDACTED]')
+    .replace(/(\bBearer\s+)[^\s,;]+/giu, '$1[REDACTED]')
+    .replace(/([?&](?:api[_-]?key|access[_-]?token|token)=)[^&\s]+/giu, '$1[REDACTED]')
+    .replace(/\bsk-[a-z0-9._-]{8,}\b/giu, '[REDACTED]')
+    .replace(/\u001B\[[0-?]*[ -/]*[@-~]/gu, '')
+    .replace(/[\u0000-\u001F\u007F]+/gu, ' ')
+    .trim()
+  return sanitized.length <= MAX_PROVIDER_DIAGNOSTIC_CHARS
+    ? sanitized
+    : `${sanitized.slice(0, MAX_PROVIDER_DIAGNOSTIC_CHARS)}...`
+}
+
+function providerDiagnosticSecrets(environment: NodeJS.ProcessEnv = process.env): readonly string[] {
+  const secrets = new Set<string>()
+  for (const [name, value] of Object.entries(environment)) {
+    if (typeof value !== 'string') continue
+    if (/(?:api[_-]?key|token|secret|password|credential)/iu.test(name)) {
+      secrets.add(value)
+      secrets.add(value.trim())
+    }
+    if (/^(?:https?|all)_proxy$/iu.test(name)) {
+      secrets.add(value)
+      secrets.add(value.trim())
+      try {
+        const proxy = new URL(value)
+        for (const component of [proxy.username, proxy.password]) {
+          if (component.length === 0) continue
+          secrets.add(component)
+          try { secrets.add(decodeURIComponent(component)) } catch { /* retain encoded component */ }
+        }
+      } catch { /* a malformed proxy still has its exact value redacted */ }
+    }
+  }
+  return [...secrets]
 }

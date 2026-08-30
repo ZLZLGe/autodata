@@ -687,6 +687,7 @@ interface FixtureOptions {
   readonly experimentStartFailures?: number
   readonly experimentTerminalFailure?: boolean
   readonly materializationCorruption?: 'harness' | 'seed' | 'source' | 'provenance' | 'rank' | 'oversized-plan'
+  readonly expectedProposalContextSha256?: string
 }
 
 function fixture(options: FixtureOptions = {}) {
@@ -727,6 +728,9 @@ function fixture(options: FixtureOptions = {}) {
     materializer,
     validator,
     run_root: resolve(root, 'generations'),
+    ...(options.expectedProposalContextSha256 === undefined
+      ? {}
+      : { expected_proposal_context_sha256: options.expectedProposalContextSha256 }),
     poll_interval_ms: 0,
     jobs,
     now: () => new Date('2026-08-30T00:00:00.000Z'),
@@ -758,7 +762,10 @@ async function startAndWait(value: ReturnType<typeof fixture>): Promise<JobOutco
   return value.jobs.done(started.job_id as JobId)
 }
 
-function restartGeneration(value: ReturnType<typeof fixture>): { readonly controller: GenerationController; readonly jobs: FakeJobs } {
+function restartGeneration(
+  value: ReturnType<typeof fixture>,
+  expectedProposalContextSha256?: string,
+): { readonly controller: GenerationController; readonly jobs: FakeJobs } {
   const jobs = new FakeJobs()
   const ctx = new Context()
   contexts.push(ctx)
@@ -769,6 +776,9 @@ function restartGeneration(value: ReturnType<typeof fixture>): { readonly contro
     materializer: value.materializer,
     validator: value.validator,
     run_root: resolve(value.root, 'generations'),
+    ...(expectedProposalContextSha256 === undefined
+      ? {}
+      : { expected_proposal_context_sha256: expectedProposalContextSha256 }),
     poll_interval_ms: 0,
     jobs,
     now: () => new Date('2026-08-30T00:00:01.000Z'),
@@ -784,6 +794,40 @@ async function completeGeneration(value: ReturnType<typeof fixture>): Promise<Ge
 }
 
 describe('GenerationController fake end-to-end workflow', () => {
+  it('rejects a protocol-bound proposal-context mismatch before claiming or calling the model', () => {
+    const value = fixture({ expectedProposalContextSha256: '0'.repeat(64) })
+
+    expect(() => value.generation.start(value.request)).toThrowError(expect.objectContaining({
+      code: 'ARTIFACT_INVALID',
+    }))
+    expect(value.proposer.requests).toHaveLength(0)
+    expect(existsSync(resolve(value.root, 'generations', PROFILE_ID, 'first-h1-claim.json'))).toBe(false)
+  })
+
+  it('accepts the exact protocol-bound context and revalidates it on fresh-process resume', async () => {
+    const reference = fixture()
+    await completeGeneration(reference)
+    const referenceContext = readFileSync(resolve(
+      reference.root,
+      'generations',
+      PROFILE_ID,
+      reference.request.run_id,
+      'proposal-context.json',
+    ))
+    const expectedProposalContextSha256 = createHash('sha256').update(referenceContext).digest('hex')
+
+    const value = fixture({ expectedProposalContextSha256 })
+    await completeGeneration(value)
+    await value.generation.dispose()
+
+    const restarted = restartGeneration(value, expectedProposalContextSha256)
+    const resumed = restarted.controller.resume(PROFILE_ID, value.request.run_id)
+    await expect(restarted.jobs.done(resumed.job_id as JobId)).resolves.toMatchObject({
+      status: 'completed',
+      detail: 'Stage 4C runtime restored',
+    })
+  })
+
   it('caps ephemeral repair at three failed drafts without persisting a formal candidate', async () => {
     const value = fixture({ validatorOk: false })
 

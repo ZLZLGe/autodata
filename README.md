@@ -21,7 +21,10 @@ AutoData 是为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harne
 DSH Agent/Session/Tool loop，并验证直接候选提交，Gate 3 已完成。Python 训练
 和 GPU 评测由 [Stage 4A 兼容性闸门](docs/stage4a-gpu-gate.md) 接管；控制面与
 离线测试已实现，正式 H200 train/eval 已于 2026-08-30 通过，Gate 4A 已完成。
-详细实验记录与 artifact 证据保存在项目飞书实验台账。
+Stage 4B 的 16-step H₀ 正式基线及 50-case BFCL 评测也已完成，B_dev 五类
+等权 macro 为 0.8。Stage 4C 的原 FreeRouter run 在候选生成前因 provider
+基础设施错误终止；其证据保持不变，当前通过追加式 PJLAB recovery 继续同一个
+逻辑 H₁。详细实验记录与 artifact 证据保存在项目飞书实验台账。
 
 ## 阶段二（Gate 2 已完成）
 
@@ -137,6 +140,32 @@ DataPlugin 候选。凭据只通过 `FREEROUTER_API_KEY` 环境变量引用；�
 传输错误。失败只打印脱敏后的稳定错误码与消息；成功 JSON 会记录工具调用顺序、
 候选状态和版本、实际启动的重试次数，以及所有 provider attempt 已报告的汇总
 token usage。
+
+Stage 4C 当前 Evolver 路由使用 PJLAB 的 OpenAI-compatible Chat Completions
+接口；独立的连通性检查为：
+
+```sh
+PJLAB_API_KEY=... pnpm smoke:pjlab
+```
+
+该检查固定调用 `pjlab/glm-5.3-flash`，通过真实 DSH Agent loop 验证 SSE 与
+Stage 4C 使用的 `max_tokens=16384`，但只发送无候选上下文的 `Reply with
+exactly OK.`。密钥只从 `PJLAB_API_KEY` 读取，不写入配置或结果；它不创建
+generation、candidate 或 experiment，也不计作正式 H₁ 草稿。成功摘要会明确
+报告实际 provider attempt 与 retry 数量。
+
+正式恢复先在无模型请求的 `prepare` 步骤中校验原失败 run、冻结 H₀、
+Evolution 状态和模型可见上下文，并创建唯一、追加式协议修订；之后才允许启动：
+
+```sh
+pnpm stage4c:first-h1 prepare
+PJLAB_API_KEY=... pnpm stage4c:first-h1 start
+PJLAB_API_KEY=... pnpm stage4c:first-h1 resume
+```
+
+恢复 generation 使用独立的
+`/data/codex-work/autodata/runs/generation-recoveries/stage4c-pjlab-01`
+根目录；原 FreeRouter claim、run 和三次失败 response 不会被删除或改写。
 
 ## 安装本地候选版本
 

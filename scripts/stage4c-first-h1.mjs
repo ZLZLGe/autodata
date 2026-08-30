@@ -6,20 +6,26 @@ import { dirname, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { isDeepStrictEqual } from 'node:util'
 import {
-  FREEROUTER_API_KEY_ENV,
-  FREEROUTER_MODEL,
-  FREEROUTER_PROVIDER,
-  assertFreerouterSmokeConfig,
-  createFreerouterLlmConfig,
-  hasFreerouterApiKey,
-} from './freerouter-config.mjs'
+  PJLAB_API_KEY_ENV,
+  PJLAB_MODEL,
+  PJLAB_PROVIDER,
+  assertPjlabConfig,
+  createPjlabLlmConfig,
+  hasPjlabApiKey,
+} from './pjlab-config.mjs'
 import { diagnostic } from './smoke-diagnostics.mjs'
 import { installEnvironmentProxy } from './smoke-proxy.mjs'
-import { resolveStage4CExecutionIdentity } from './stage4c-run-identity.mjs'
+import {
+  STAGE4C_ORIGINAL_EXECUTION,
+  createStage4CRecoveryAmendment,
+  verifyStage4CRecoveryAmendment,
+} from './stage4c-recovery-amendment.mjs'
+import { summarizeStage4CExecution } from './stage4c-run-summary.mjs'
 
 const PROJECT_ROOT = realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), '..'))
 const AUTODATA_HOME = '/data/codex-work/autodata/evolution'
-const GENERATION_RUN_ROOT = '/data/codex-work/autodata/runs/generations'
+const ORIGINAL_GENERATION_RUN_ROOT = '/data/codex-work/autodata/runs/generations'
+const GENERATION_RUN_ROOT = '/data/codex-work/autodata/runs/generation-recoveries/stage4c-pjlab-01'
 const EXPERIMENT_RUN_ROOT = '/data/codex-work/autodata/runs/experiments'
 const EXPERIMENT_STAGING_ROOT = '/mnt/shared-storage-user/gezhilong/autodata/staging/experiments'
 const H0_RUN_ID = 'h0-f058c05bd893-20260830'
@@ -36,19 +42,19 @@ const PROFILE_ID = 'bfcl-v4'
 const STRATEGY_VERSION = '1'
 const POLL_INTERVAL_MS = 10_000
 const TERMINAL_STATUSES = new Set(['succeeded', 'failed', 'cancelled', 'recovery_required'])
-const COMMANDS = new Set(['auto', 'start', 'resume', 'status'])
+const COMMANDS = new Set(['prepare', 'auto', 'start', 'resume', 'status'])
 
 const command = process.argv[2] ?? 'auto'
 if (command === '--help' || command === '-h') {
-  console.log('Usage: node scripts/stage4c-first-h1.mjs [auto|start|resume|status]')
+  console.log('Usage: node scripts/stage4c-first-h1.mjs [prepare|auto|start|resume|status]')
 } else if (!COMMANDS.has(command) || process.argv.length > 3) {
-  console.error('Usage: node scripts/stage4c-first-h1.mjs [auto|start|resume|status]')
+  console.error('Usage: node scripts/stage4c-first-h1.mjs [prepare|auto|start|resume|status]')
   process.exitCode = 64
 } else {
   try {
     const result = await run(command)
     console.log(JSON.stringify(result.summary))
-    if (command !== 'status') {
+    if (command !== 'status' && command !== 'prepare') {
       if (result.summary.status === 'recovery_required') process.exitCode = 2
       else if (result.summary.status !== 'succeeded') process.exitCode = 1
     }
@@ -59,8 +65,33 @@ if (command === '--help' || command === '-h') {
 }
 
 async function run(requestedCommand) {
-  const execution = formalExecutionIdentity()
+  const git = formalGitIdentity()
   preflightEvidenceBoundary()
+  const protocol = requestedCommand === 'prepare'
+    ? createStage4CRecoveryAmendment(recoveryOptions(git.commit))
+    : verifyStage4CRecoveryAmendment(recoveryOptions(git.commit))
+  const execution = recoveryExecution(protocol.amendment, git)
+  const amendmentSha256 = createHash('sha256').update(readFileSync(protocol.path)).digest('hex')
+  if (requestedCommand === 'prepare') {
+    return {
+      summary: Object.freeze({
+        schema_version: 'autodata-stage4c-recovery-preparation-1',
+        status: 'prepared',
+        amendment_created: protocol.created,
+        amendment_path: protocol.path,
+        amendment_sha256: amendmentSha256,
+        same_logical_h1: true,
+        original_generation_run_id: STAGE4C_ORIGINAL_EXECUTION.generation_run_id,
+        recovery_generation_run_id: execution.generation_run_id,
+        recovery_experiment_run_id: execution.experiment_run_id,
+        recovery_candidate_id: execution.candidate_id,
+        execution_commit: execution.commit,
+        provider: PJLAB_PROVIDER,
+        model: PJLAB_MODEL,
+        b_test_touched: false,
+      }),
+    }
+  }
   process.env.AUTODATA_HOME = AUTODATA_HOME
   process.env.DSH_TOOLS_MODE = 'native'
 
@@ -68,8 +99,8 @@ async function run(requestedCommand) {
   let disposeEnvironmentProxy
   try {
     disposeEnvironmentProxy = await installEnvironmentProxy()
-    const llmConfig = createFreerouterLlmConfig()
-    assertFreerouterSmokeConfig(llmConfig)
+    const llmConfig = createPjlabLlmConfig()
+    assertPjlabConfig(llmConfig)
     const [
       { Context },
       { default: AgentRegistry },
@@ -115,7 +146,10 @@ async function run(requestedCommand) {
         asset_root: EXPERIMENT_ASSET_ROOT,
         common_worker_root: COMMON_WORKER_ROOT,
       },
-      generation: { run_root: GENERATION_RUN_ROOT },
+      generation: {
+        run_root: GENERATION_RUN_ROOT,
+        expected_proposal_context_sha256: protocol.amendment.evidence_sha256.proposal_context,
+      },
     })
     await ctx.plugin(AgentLoop, { agents: [] })
 
@@ -130,8 +164,8 @@ async function run(requestedCommand) {
       throw new Error('existing Stage 4C generation is bound to a different full Git commit')
     }
     const operation = resolveOperation(requestedCommand, existing?.state.status)
-    if ((operation === 'start' || operation === 'resume') && !hasFreerouterApiKey()) {
-      throw new Error(`${FREEROUTER_API_KEY_ENV} is required for ${operation}`)
+    if ((operation === 'start' || operation === 'resume') && !hasPjlabApiKey()) {
+      throw new Error(`${PJLAB_API_KEY_ENV} is required for ${operation}`)
     }
 
     let status
@@ -147,7 +181,23 @@ async function run(requestedCommand) {
     if (operation !== 'status' && status.job_id !== undefined) {
       status = await pollUntilSettled(controller, status, execution)
     }
-    return { summary: summarize(requestedCommand, operation, status.state, execution) }
+    return {
+      summary: summarizeStage4CExecution({
+        requestedCommand,
+        operation,
+        state: status.state,
+        execution,
+        provider: PJLAB_PROVIDER,
+        model: PJLAB_MODEL,
+        profileId: PROFILE_ID,
+        protocolAmendment: {
+          id: protocol.amendment.amendment_id,
+          sha256: amendmentSha256,
+          path: protocol.path,
+          originalGenerationRunId: STAGE4C_ORIGINAL_EXECUTION.generation_run_id,
+        },
+      }),
+    }
   } finally {
     if (ctx !== undefined) await ctx.fiber.dispose().catch(() => undefined)
     if (disposeEnvironmentProxy !== undefined) await disposeEnvironmentProxy().catch(() => undefined)
@@ -212,47 +262,7 @@ async function pollUntilSettled(controller, initialStatus, execution) {
   }
 }
 
-function summarize(requestedCommand, operation, state, execution) {
-  const closedLoop = state.status === 'succeeded' && state.phase === 'complete' && state.decision !== undefined
-  const outcome = !closedLoop
-    ? 'incomplete'
-    : state.decision.accepted
-      ? 'h1_accepted'
-      : 'h1_rejected_closed_loop'
-  return Object.freeze({
-    schema_version: 'autodata-stage4c-first-h1-summary-1',
-    requested_command: requestedCommand,
-    operation,
-    provider: FREEROUTER_PROVIDER,
-    model: FREEROUTER_MODEL,
-    execution_commit: execution.commit,
-    execution_commit_short: execution.short_commit,
-    profile_id: PROFILE_ID,
-    generation_run_id: execution.generation_run_id,
-    experiment_run_id: execution.experiment_run_id,
-    candidate_id: execution.candidate_id,
-    status: state.status,
-    phase: state.phase,
-    draft_attempts: state.attempts.length,
-    failed_drafts: state.attempts.filter(attempt => attempt.status === 'failed').length,
-    formal_candidate_persisted: state.formal_candidate_persisted,
-    experiment_started: state.experiment_started === true,
-    decision: state.decision === undefined ? null : {
-      accepted: state.decision.accepted,
-      reason: state.decision.reason,
-      candidate_score: state.decision.candidate_score,
-      baseline_score: state.decision.baseline_score,
-    },
-    h1_feedback_registered: state.feedback_id !== undefined,
-    outcome,
-    closed_loop,
-    requires_resume: state.status === 'recovery_required',
-    restart_reconciliation_exercised: operation === 'resume' && state.status === 'succeeded',
-    b_test_touched: false,
-  })
-}
-
-function formalExecutionIdentity() {
+function formalGitIdentity() {
   let repositoryRoot
   let commit
   let status
@@ -279,10 +289,39 @@ function formalExecutionIdentity() {
   if (forbidden.length > 0) {
     throw new Error(`formal Stage 4C requires a clean tracked/untracked tree; forbidden entries: ${forbidden.join(', ')}`)
   }
-  return resolveStage4CExecutionIdentity({
-    generationRunRoot: GENERATION_RUN_ROOT,
-    profileId: PROFILE_ID,
-    commit,
+  return Object.freeze({ commit, short_commit: commit.slice(0, 12) })
+}
+
+function recoveryOptions(recoveryCommit) {
+  return Object.freeze({
+    originalGenerationRoot: ORIGINAL_GENERATION_RUN_ROOT,
+    recoveryGenerationRoot: GENERATION_RUN_ROOT,
+    experimentRunRoot: EXPERIMENT_RUN_ROOT,
+    experimentStagingRoot: EXPERIMENT_STAGING_ROOT,
+    evolutionRoot: AUTODATA_HOME,
+    recoveryCommit,
+    provider: PJLAB_PROVIDER,
+    model: PJLAB_MODEL,
+  })
+}
+
+function recoveryExecution(amendment, git) {
+  const recovery = amendment?.recovery_execution
+  if (
+    recovery?.execution_commit !== git.commit
+    || recovery.provider !== PJLAB_PROVIDER
+    || recovery.model !== PJLAB_MODEL
+    || recovery.generation_root !== GENERATION_RUN_ROOT
+    || typeof recovery.generation_run_id !== 'string'
+    || typeof recovery.experiment_run_id !== 'string'
+    || typeof recovery.candidate_id !== 'string'
+  ) throw new Error('Stage 4C recovery amendment identity does not match the current execution')
+  return Object.freeze({
+    commit: git.commit,
+    short_commit: git.short_commit,
+    generation_run_id: recovery.generation_run_id,
+    experiment_run_id: recovery.experiment_run_id,
+    candidate_id: recovery.candidate_id,
   })
 }
 
@@ -525,7 +564,7 @@ function isErrorCode(error, code) {
 
 function secrets() {
   return [
-    process.env[FREEROUTER_API_KEY_ENV],
+    process.env[PJLAB_API_KEY_ENV],
     process.env.HTTPS_PROXY,
     process.env.https_proxy,
     process.env.HTTP_PROXY,

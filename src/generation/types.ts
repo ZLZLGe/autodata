@@ -216,6 +216,8 @@ export interface GenerationControllerOptions {
   readonly materializer?: GenerationMaterializer
   readonly validator?: CandidateValidator
   readonly run_root?: string
+  /** Optional byte hash of canonical proposal-context JSON plus its trailing newline. */
+  readonly expected_proposal_context_sha256?: string
   readonly poll_interval_ms?: number
   readonly jobs?: GenerationJobRegistry
   readonly now?: () => Date
