@@ -144,4 +144,66 @@ describe('generation proposal Agent diagnostics', () => {
       && error.cause === undefined
     ))
   })
+
+  it('puts the exact DataSelection runtime schema in the model-visible proposal prompt', async () => {
+    const events: unknown[] = []
+    let outbound = ''
+    const proposer = new DshGenerationProposer({
+      get: () => ({
+        create: async () => ({
+          agent: {
+            status: 'idle',
+            session: { events },
+            followup: (message: unknown) => {
+              outbound = JSON.stringify(message)
+              events.push({
+                type: 'assistant/message',
+                data: {
+                  turn: 1,
+                  message: {
+                    content: [{
+                      type: 'text',
+                      text: '{"host_source":"return {};","description":"fixture"}',
+                    }],
+                  },
+                },
+              }, {
+                type: 'turn/end',
+                data: { turn: 1, reason: { kind: 'completed' } },
+              })
+            },
+            whenIdle: async () => undefined,
+            cancel: () => undefined,
+          },
+          dispose: async () => undefined,
+        }),
+      }),
+    } as unknown as Context)
+    const session = await proposer.create('bfcl-v4', 'runtime-contract', new AbortController().signal)
+
+    await expect(session.propose({
+      attempt: 1,
+      max_attempts: 3,
+      context: {
+        profile_id: 'bfcl-v4',
+        benchmark: 'bfcl-v4',
+        strategy_plugin_id: 'bfcl-v4-strategy',
+        strategy_version: '1',
+        generation: 1,
+        seed: 42,
+        allowed_capabilities: ['data-select'],
+        b_search: { summary: 'fixture', metrics: {}, failures: [] },
+        source_pool: { canonical_records: 1, canonical_jsonl_sha256: '0'.repeat(64), records: [] },
+      },
+    }, new AbortController().signal)).resolves.toEqual({
+      host_source: 'return {};',
+      description: 'fixture',
+    })
+    expect(outbound).toContain('readonly DataSelection array')
+    expect(outbound).toContain('input[i].record.source.record_id')
+    expect(outbound).toContain('planning summaries only; they are not the runtime run input')
+    expect(outbound).toContain('input.map(item => ({ record_id: item.record.source.record_id }))')
+    expect(outbound).toContain('If input.length is nonzero it must return at least one decision')
+    expect(outbound).toContain('Do not search wrapper objects')
+  })
 })

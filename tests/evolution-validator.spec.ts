@@ -229,6 +229,25 @@ describe('candidate process validator', () => {
     `))
     expect(fixtureFailure).toMatchObject({ ok: false })
     expect(fixtureFailure.reason).toMatch(/empty|selected records|training view/iu)
+
+    const wrongRuntimeShape = await validator().validate(profile, candidate(`
+      return {
+        inject: ['autodata'],
+        apply(ctx) {
+          ctx.autodata.register({
+            id: 'bfcl-strategy', version: '1',
+            run(input) {
+              return input
+                .map(item => item.record_id)
+                .filter(id => typeof id === 'string')
+                .map(record_id => ({ record_id }))
+            },
+          })
+        },
+      }
+    `))
+    expect(wrongRuntimeShape).toMatchObject({ ok: false })
+    expect(wrongRuntimeShape.reason).toMatch(/empty|selected records|training view/iu)
   })
 
   it('hard-kills asynchronous validation that escapes the VM timeout', async () => {

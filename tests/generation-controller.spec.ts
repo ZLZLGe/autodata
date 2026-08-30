@@ -256,7 +256,10 @@ class FakeJobs implements GenerationJobRegistry {
 class FixedValidator implements CandidateValidator {
   calls = 0
 
-  constructor(private readonly ok: boolean) {}
+  constructor(
+    private readonly ok: boolean,
+    private readonly reason = 'fixture rejected the ephemeral draft',
+  ) {}
 
   async validate(profile: TaskProfile, candidate: CandidatePackage): Promise<CandidateValidationResult> {
     this.calls += 1
@@ -266,7 +269,7 @@ class FixedValidator implements CandidateValidator {
       ok: this.ok,
       ...(this.ok
         ? { plugin_id: profile.strategy_plugin_id, plugin_version: candidate.manifest.strategy_version }
-        : { reason: 'fixture rejected the ephemeral draft' }),
+        : { reason: this.reason }),
     }
   }
 }
@@ -681,6 +684,7 @@ class FakeExperiment {
 
 interface FixtureOptions {
   readonly validatorOk?: boolean
+  readonly validatorReason?: string
   readonly materializationVariants?: readonly string[]
   readonly candidateScore?: number
   readonly experimentPending?: boolean
@@ -694,7 +698,7 @@ function fixture(options: FixtureOptions = {}) {
   const root = mkdtempSync(resolve(tmpdir(), 'autodata-generation-controller-'))
   directories.push(root)
   const baseline = makeBaseline(root)
-  const validator = new FixedValidator(options.validatorOk ?? true)
+  const validator = new FixedValidator(options.validatorOk ?? true, options.validatorReason)
   const runtime = new FakeRuntime()
   const store = new MemoryEvolutionStore()
   const evolution = new EvolutionController({ store, validator, runtime })
@@ -842,6 +846,24 @@ describe('GenerationController fake end-to-end workflow', () => {
     expect(state).toMatchObject({ status: 'failed', phase: 'proposing', formal_candidate_persisted: false })
     expect(value.evolution.status(PROFILE_ID).state).toMatchObject({ open_candidate_id: null, generation: 0 })
     expect(value.experiment.starts).toHaveLength(0)
+  })
+
+  it('gives the next draft concise actionable feedback while retaining full validation evidence', async () => {
+    const validatorReason = [
+      'AutoDataCoreError: plugin pipeline produced no selected records',
+      '    at runDataCore (/root/autodata/lib/core/runner.js:292:15)',
+      '    at main (/root/autodata/lib/evolution/validator-worker.js:93:9)',
+    ].join('\n')
+    const value = fixture({ validatorOk: false, validatorReason })
+
+    await expect(startAndWait(value)).resolves.toMatchObject({ status: 'failed', detail: 'PROPOSAL_FAILED' })
+
+    const feedback = value.proposer.requests[1]?.previous_failure
+    expect(feedback).toContain('item.record.source.record_id')
+    expect(feedback).not.toContain('at runDataCore')
+    expect(feedback?.length).toBeLessThanOrEqual(1000)
+    expect(value.generation.status(PROFILE_ID, value.request.run_id).state.attempts[0]?.failure)
+      .toBe(validatorReason)
   })
 
   it('persists the one-formal-H1 claim even when all ephemeral drafts fail', async () => {

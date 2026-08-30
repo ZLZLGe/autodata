@@ -64,6 +64,7 @@ const EVALUATION_REPORT_FILE = 'evaluation-report.json'
 const EXPERIMENT_CONTRACT_FILE = 'experiment-contract.json'
 const FEEDBACK_FILE = 'feedback.json'
 const MAX_DRAFT_FAILURE_CHARACTERS = 8192
+const MAX_MODEL_REPAIR_FEEDBACK_CHARACTERS = 1000
 
 interface LiveGeneration {
   readonly abort: AbortController
@@ -368,7 +369,7 @@ export class GenerationController {
     let state = this.save(initial, { phase: 'proposing', status: 'running' })
     state = await this.reconcileOrphanDrafts(state, frozen, live)
     if (state.phase === 'candidate_ready') return state
-    let previousFailure = state.attempts.at(-1)?.failure
+    let previousFailure = modelRepairFeedback(state.attempts.at(-1)?.failure)
     for (let attempt = state.attempts.length + 1; attempt <= GENERATION_MAX_DRAFTS; attempt += 1) {
       if (live.abort.signal.aborted) throw new GenerationError('candidate proposal was cancelled', 'CANCEL_FAILED')
       const directory = resolve(state.run_directory, 'attempts', `draft-${String(attempt).padStart(2, '0')}`)
@@ -447,7 +448,7 @@ export class GenerationController {
           failure,
         }
         state = this.save(state, { phase: 'proposing', attempts: [...state.attempts, record] })
-        previousFailure = failure
+        previousFailure = modelRepairFeedback(failure)
         this.note(live, `ephemeral draft ${String(attempt)} failed: ${failure}`)
       }
     }
@@ -1822,6 +1823,16 @@ export class GenerationController {
   private assertUsable(): void {
     if (this.disposed) throw new GenerationError('generation controller is disposed', 'DEPENDENCY_UNAVAILABLE')
   }
+}
+
+function modelRepairFeedback(failure: string | undefined): string | undefined {
+  if (failure === undefined) return undefined
+  const headline = failure.split(/\r?\n/u, 1)[0]?.trim() ?? ''
+  if (headline.length === 0) return 'The previous draft failed without a diagnostic.'
+  const actionable = /plugin pipeline produced no selected records/iu.test(headline)
+    ? `${headline}. Runtime input is DataSelection[]; read IDs from item.record.source.record_id and return at least one decision when input is non-empty.`
+    : headline
+  return actionable.slice(0, MAX_MODEL_REPAIR_FEEDBACK_CHARACTERS)
 }
 
 function materializationEvidence(value: GenerationMaterialization): Record<string, unknown> {
