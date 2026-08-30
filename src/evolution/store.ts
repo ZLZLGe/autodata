@@ -266,6 +266,7 @@ export function validateEvolutionSnapshot(
   stateInput: EvolutionState,
   candidateInputs: readonly CandidatePackage[],
   feedbackInputs: readonly EvolutionFeedback[] = [],
+  evaluationInputs: readonly EvaluationRecord[] = [],
 ): EvolutionSnapshot {
   const profile = normalizeTaskProfile(profileInput)
   const state = validateEvolutionState(stateInput)
@@ -366,6 +367,89 @@ export function validateEvolutionSnapshot(
       })
     }
   }
+
+  const referencedEvaluationIds = new Set(state.candidates.flatMap(candidate =>
+    candidate.evaluation === undefined ? [] : [candidate.evaluation.report_id]))
+  const evaluationRecords = evaluationInputs
+    .filter((record) => {
+      const report = (record as unknown as { report?: unknown }).report
+      return typeof report === 'object' && report !== null
+        && referencedEvaluationIds.has((report as { report_id?: unknown }).report_id as string)
+    })
+    .map(snapshotEvaluation)
+  const evaluationById = new Map<string, EvaluationRecord>()
+  for (const record of evaluationRecords) {
+    if (evaluationById.has(record.report.report_id)) {
+      throw new EvolutionError(`duplicate evaluation record ${record.report.report_id}`, 'STATE_CORRUPT', {
+        profile_id: profile.id,
+        candidate_id: record.report.candidate_id,
+      })
+    }
+    evaluationById.set(record.report.report_id, record)
+  }
+  for (const candidate of state.candidates) {
+    if (candidate.evaluation === undefined) continue
+    const summary = candidate.evaluation
+    const record = evaluationById.get(summary.report_id)
+    if (record === undefined) {
+      throw new EvolutionError(`evaluation ${summary.report_id} is referenced by state.json but missing`, 'STATE_CORRUPT', {
+        profile_id: profile.id,
+        candidate_id: candidate.candidate_id,
+      })
+    }
+    const report = record.report
+    if (
+      report.profile_id !== profile.id
+      || report.report_id !== summary.report_id
+      || report.candidate_id !== summary.candidate_id
+      || report.benchmark !== summary.benchmark
+      || report.split !== summary.split
+      || report.metric !== summary.metric
+      || report.score !== summary.score
+    ) {
+      throw new EvolutionError(`evaluation ${summary.report_id} does not match state.json`, 'STATE_CORRUPT', {
+        profile_id: profile.id,
+        candidate_id: candidate.candidate_id,
+      })
+    }
+    if (candidate.candidate_id === H0_CANDIDATE_ID) {
+      if (
+        record.decision !== undefined
+        || !report.complete
+        || report.cases_evaluated === undefined
+        || report.cases_expected === undefined
+        || report.cases_expected <= 0
+        || report.cases_evaluated !== report.cases_expected
+        || report.benchmark !== profile.benchmark
+        || report.split !== profile.acceptance_policy.split
+        || report.metric !== profile.acceptance_policy.metric
+        || report.baseline_candidate_id !== undefined
+        || report.baseline_score !== undefined
+      ) {
+        throw new EvolutionError(`H0 baseline evaluation ${summary.report_id} is invalid`, 'STATE_CORRUPT', {
+          profile_id: profile.id,
+          candidate_id: candidate.candidate_id,
+        })
+      }
+    } else {
+      const decision = record.decision
+      const shouldBeAccepted = candidate.status === 'accepted' || candidate.status === 'retired'
+      if (
+        decision === undefined
+        || decision.accepted !== shouldBeAccepted
+        || (shouldBeAccepted && (
+          report.benchmark !== profile.benchmark
+          || report.split !== profile.acceptance_policy.split
+          || report.metric !== profile.acceptance_policy.metric
+        ))
+      ) {
+        throw new EvolutionError(`evaluation ${summary.report_id} decision contradicts state.json`, 'STATE_CORRUPT', {
+          profile_id: profile.id,
+          candidate_id: candidate.candidate_id,
+        })
+      }
+    }
+  }
   return Object.freeze({
     profile,
     state,
@@ -374,6 +458,8 @@ export function validateEvolutionSnapshot(
       .map(candidate => byId.get(candidate.candidate_id) ?? packages.find(value =>
         value.manifest.candidate_id === candidate.candidate_id)!)),
     feedback_records: Object.freeze(state.feedback_ids.map(feedbackId => feedbackById.get(feedbackId)!)),
+    evaluation_records: Object.freeze(state.candidates.flatMap(candidate =>
+      candidate.evaluation === undefined ? [] : [evaluationById.get(candidate.evaluation.report_id)!])),
   })
 }
 
@@ -420,7 +506,18 @@ export function loadConsistentEvolutionSnapshot(store: EvolutionStore, profileId
     }
     return record
   })
-  return validateEvolutionSnapshot(profile, state, candidates, feedback)
+  const evaluations = state.candidates.flatMap((candidate) => {
+    if (candidate.evaluation === undefined) return []
+    const record = store.getEvaluation(profileId, candidate.evaluation.report_id)
+    if (record === undefined) {
+      throw new EvolutionError(`evaluation ${candidate.evaluation.report_id} is referenced by state.json but missing`, 'STATE_CORRUPT', {
+        profile_id: profile.id,
+        candidate_id: candidate.candidate_id,
+      })
+    }
+    return [record]
+  })
+  return validateEvolutionSnapshot(profile, state, candidates, feedback, evaluations)
 }
 
 /** Process-local Store with the same append/replace semantics as the file Store. */

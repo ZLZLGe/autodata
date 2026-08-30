@@ -39,6 +39,11 @@
       "import": "./lib/evolution/index.js",
       "default": "./lib/evolution/index.js"
     },
+    "./experiment": {
+      "types": "./lib/experiment/index.d.ts",
+      "import": "./lib/experiment/index.js",
+      "default": "./lib/experiment/index.js"
+    },
     "./stage4a": {
       "types": "./lib/stage4a/index.d.ts",
       "import": "./lib/stage4a/index.js",
@@ -53,6 +58,7 @@
     "README.md",
     "docs",
     "stage4a",
+    "stage4b",
     "LICENSE"
   ],
   "publishConfig": {
@@ -68,7 +74,7 @@
     "build": "pnpm run clean && tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json",
     "test": "pnpm run build && vitest run",
-    "test:python": "scripts/test-stage4a-python.sh",
+    "test:python": "scripts/test-stage4a-python.sh && scripts/test-stage4b-python.sh",
     "test:profile": "pnpm run build && node scripts/profile-smoke.mjs",
     "smoke:freerouter": "pnpm run build && node scripts/freerouter-agent-smoke.mjs",
     "pack:check": "npm pack --dry-run",

@@ -3,7 +3,7 @@ import { CallId } from '@deepseek-ai/dsh-llm'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import { describe, expect, it } from 'vitest'
-import AutoDataService, { getStage4AController } from '../src/service.js'
+import AutoDataService, { getExperimentController, getStage4AController } from '../src/service.js'
 import { MemoryEvolutionStore } from '../src/evolution/store.js'
 import * as AutoDataStatusTool from '../src/tool.js'
 import type { DataPlugin, SourceAdapter } from '../src/core/types.js'
@@ -380,11 +380,14 @@ describe('AutoData DSH lifecycle', () => {
     expect(context.tools).toBeUndefined()
     expect('execute' in context).toBe(false)
     expect('stage4a' in ctx.autodata).toBe(false)
+    expect('experiment' in ctx.autodata).toBe(false)
     expect(getStage4AController(ctx)).toBeDefined()
+    expect(getExperimentController(ctx)).toBeDefined()
     expect(ctx.autodata.status().capabilities.some(capability => capability.includes('stage4'))).toBe(false)
     expect(Object.isFrozen(context)).toBe(true)
     await serviceFiber.dispose()
     expect(() => getStage4AController(ctx)).toThrow(/unavailable/iu)
+    expect(() => getExperimentController(ctx)).toThrow(/unavailable/iu)
     await ctx.fiber.dispose()
   })
 

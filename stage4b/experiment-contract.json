@@ -1,0 +1,202 @@
+{
+  "schema_version": "autodata-experiment-contract-1",
+  "contract_id": "stage4b-h0-baseline-1",
+  "profile": {
+    "id": "bfcl-v4",
+    "benchmark": "bfcl-v4",
+    "metric": "equal_category_accuracy"
+  },
+  "data": {
+    "dataset_id": "nex-agi/agent-sft",
+    "dataset_subset": "tool_calling",
+    "dataset_revision": "d8d4de5643f9fe9d3fc3f89b3d55b8709ddc35c9",
+    "harness_id": "toolcall-h0",
+    "seed": 42,
+    "canonical_records": 100,
+    "logical_training_units": 236,
+    "historical_training_tokens": 508114,
+    "canonical_jsonl_sha256": "c5c57f65bb58ddecf4d83d576a0fc7341153933bab2ce9b9596b20f9496a9db4",
+    "logical_view_jsonl_sha256": "984a2fd580c28d2b4f5a4256e33997b221d309bb7b0c6d4fedb424a47a1fafc6",
+    "run_summary_json_sha256": "8b845ffead9b96d42e9767406a2fe1519232280f4a79d8259be2276713cb2096"
+  },
+  "model": {
+    "id": "Qwen/Qwen3.5-9B",
+    "revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+    "path": "/mnt/shared-storage-gpfs2/gpfs2-shared-public/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+    "thinking": false,
+    "expected_parameters": 9409813744
+  },
+  "execution": {
+    "container_image": "registry.h.pjlab.org.cn/ailab/pytorch2.7.0-cuda12.8-cudnn9:v5",
+    "rjob_backoff_limit": 1,
+    "training_wheelhouse": {
+      "path": "/mnt/shared-storage-user/gezhilong/dataharness/dependencies/ms-swift-4.5.2-py311-torch2.7-cu128-v3/wheelhouse",
+      "manifest_sha256": "e046861cb51416e092fcb9960f4a496624ee227843fe9eef0c7551beaf0cc8b2"
+    },
+    "vllm_wheelhouse": {
+      "path": "/mnt/shared-storage-user/gezhilong/autodata/dependencies/vllm-0.19.1-transformers-5.15.1-py311-cu128/wheelhouse",
+      "manifest_sha256": "55b2bfbd4b489dd2e7b7f2e799a0de77aa7c2955f6fdab0b637cdc7213525cd1"
+    },
+    "bfcl_wheelhouse": {
+      "path": "/mnt/shared-storage-user/gezhilong/dataharness/dependencies/bfcl-eval-2026.3.23-py311/wheelhouse",
+      "manifest_sha256": "7507a94e76979398fbc137aea24252a5a3362a478bdfecb8ed1ed18c02a720b6"
+    }
+  },
+  "training": {
+    "gpus": 4,
+    "gpu_family": "H200",
+    "max_steps": 16,
+    "max_length": 8192,
+    "per_device_train_batch_size": 1,
+    "gradient_accumulation_steps": 4,
+    "tuner_type": "full",
+    "precision": "bf16",
+    "optimizer": "adafactor",
+    "deepspeed": "zero3",
+    "packing": true,
+    "padding_free": true,
+    "gradient_checkpointing": true,
+    "use_hf": true,
+    "check_model": false,
+    "template": "qwen3_5",
+    "template_backend": "swift",
+    "enable_thinking": false,
+    "add_non_thinking_prefix": true,
+    "loss_scale": "default",
+    "is_binary_loss_scale": true,
+    "truncation_strategy": "delete",
+    "split_dataset_ratio": 0,
+    "dataset_num_proc": 4,
+    "load_from_cache_file": false,
+    "strict": true,
+    "freeze_llm": false,
+    "freeze_vit": false,
+    "freeze_aligner": false,
+    "torch_dtype": "bfloat16",
+    "bf16": true,
+    "attention_implementation": "flash_attn",
+    "packing_length": 8192,
+    "packing_num_proc": 1,
+    "packing_strategy": "sequential",
+    "learning_rate": 0.00001,
+    "lr_scheduler_type": "cosine",
+    "warmup_ratio": 0.05,
+    "weight_decay": 0.1,
+    "vit_gradient_checkpointing": true,
+    "save_strategy": "steps",
+    "save_steps": 16,
+    "save_total_limit": 1,
+    "save_only_model": false,
+    "logging_strategy": "steps",
+    "logging_steps": 1,
+    "logging_first_step": true,
+    "report_to": [
+      "none"
+    ],
+    "dataloader_num_workers": 0,
+    "seed": 42,
+    "data_seed": 42,
+    "add_version": false
+  },
+  "evaluation": {
+    "gpus": 1,
+    "gpu_family": "H200",
+    "vllm_version": "0.19.1",
+    "tool_call_parser": "qwen3_coder",
+    "bfcl_version": "2026.3.23",
+    "server": {
+      "dtype": "bfloat16",
+      "tensor_parallel_size": 1,
+      "max_model_len": 8192,
+      "gpu_memory_utilization": 0.9,
+      "generation_config": "vllm",
+      "enable_auto_tool_choice": true
+    },
+    "generation": {
+      "tool_choice": "auto",
+      "parallel_tool_calls": true,
+      "temperature": 0,
+      "top_p": 1,
+      "max_tokens": 2048,
+      "seed": 42,
+      "n": 1,
+      "stream": false,
+      "include_reasoning": false,
+      "enable_thinking": false
+    },
+    "checker": {
+      "language": "python",
+      "model_config": "qwen3-8b-FC",
+      "underscore_to_dot": true
+    },
+    "categories": [
+      "simple_python",
+      "multiple",
+      "parallel",
+      "parallel_multiple",
+      "irrelevance"
+    ],
+    "cases_per_category_per_split": 5,
+    "case_ids": {
+      "B_search": [
+        "simple_python_116",
+        "simple_python_108",
+        "simple_python_217",
+        "simple_python_206",
+        "simple_python_324",
+        "multiple_132",
+        "multiple_59",
+        "multiple_169",
+        "multiple_122",
+        "multiple_107",
+        "parallel_115",
+        "parallel_161",
+        "parallel_2",
+        "parallel_41",
+        "parallel_44",
+        "parallel_multiple_177",
+        "parallel_multiple_90",
+        "parallel_multiple_68",
+        "parallel_multiple_35",
+        "parallel_multiple_185",
+        "irrelevance_194",
+        "irrelevance_68",
+        "irrelevance_152",
+        "irrelevance_45",
+        "irrelevance_169"
+      ],
+      "B_dev": [
+        "simple_python_304",
+        "simple_python_195",
+        "simple_python_53",
+        "simple_python_35",
+        "simple_python_159",
+        "multiple_46",
+        "multiple_35",
+        "multiple_163",
+        "multiple_183",
+        "multiple_21",
+        "parallel_86",
+        "parallel_122",
+        "parallel_59",
+        "parallel_111",
+        "parallel_28",
+        "parallel_multiple_0",
+        "parallel_multiple_163",
+        "parallel_multiple_171",
+        "parallel_multiple_188",
+        "parallel_multiple_45",
+        "irrelevance_188",
+        "irrelevance_8",
+        "irrelevance_236",
+        "irrelevance_239",
+        "irrelevance_184"
+      ]
+    },
+    "macro": "equal_category_accuracy"
+  },
+  "retry": {
+    "scientific_retries": 0,
+    "infrastructure_retries_per_stage": 1
+  }
+}

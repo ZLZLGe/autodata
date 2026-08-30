@@ -1,0 +1,85 @@
+{
+  "manifest_version": "dataharness-bfcl-small-loop-selection-1",
+  "parent_split_manifest": "bfcl-v4-offline-derived.json",
+  "selection": {
+    "algorithm": "take the five lowest SHA-256 ranks per split and category; rank input is UTF-8 decimal seed, NUL, split, NUL, category, NUL, case ID; ties use case ID",
+    "seed": 20260823,
+    "cases_per_category": 5
+  },
+  "splits": {
+    "search": {
+      "simple_python": [
+        "simple_python_116",
+        "simple_python_108",
+        "simple_python_217",
+        "simple_python_206",
+        "simple_python_324"
+      ],
+      "multiple": [
+        "multiple_132",
+        "multiple_59",
+        "multiple_169",
+        "multiple_122",
+        "multiple_107"
+      ],
+      "parallel": [
+        "parallel_115",
+        "parallel_161",
+        "parallel_2",
+        "parallel_41",
+        "parallel_44"
+      ],
+      "parallel_multiple": [
+        "parallel_multiple_177",
+        "parallel_multiple_90",
+        "parallel_multiple_68",
+        "parallel_multiple_35",
+        "parallel_multiple_185"
+      ],
+      "irrelevance": [
+        "irrelevance_194",
+        "irrelevance_68",
+        "irrelevance_152",
+        "irrelevance_45",
+        "irrelevance_169"
+      ]
+    },
+    "dev": {
+      "simple_python": [
+        "simple_python_304",
+        "simple_python_195",
+        "simple_python_53",
+        "simple_python_35",
+        "simple_python_159"
+      ],
+      "multiple": [
+        "multiple_46",
+        "multiple_35",
+        "multiple_163",
+        "multiple_183",
+        "multiple_21"
+      ],
+      "parallel": [
+        "parallel_86",
+        "parallel_122",
+        "parallel_59",
+        "parallel_111",
+        "parallel_28"
+      ],
+      "parallel_multiple": [
+        "parallel_multiple_0",
+        "parallel_multiple_163",
+        "parallel_multiple_171",
+        "parallel_multiple_188",
+        "parallel_multiple_45"
+      ],
+      "irrelevance": [
+        "irrelevance_188",
+        "irrelevance_8",
+        "irrelevance_236",
+        "irrelevance_239",
+        "irrelevance_184"
+      ]
+    }
+  }
+}

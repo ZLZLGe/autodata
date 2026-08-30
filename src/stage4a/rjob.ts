@@ -58,8 +58,16 @@ export class DshStage4ACommandRunner implements Stage4ACommandRunner {
   }
 }
 
-function resources(stage: Stage4AStage): readonly string[] {
-  return stage === 'train'
+function resources(spec: Stage4ARJobSpec): readonly string[] {
+  if (spec.resources !== undefined) {
+    return [
+      '--replicas', '1',
+      '--gpu', String(spec.resources.gpu),
+      '--cpu', String(spec.resources.cpu),
+      '--memory', String(spec.resources.memory_mib),
+    ]
+  }
+  return spec.stage === 'train'
     ? ['--replicas', '1', '--gpu', '4', '--cpu', '64', '--memory', '327680']
     : ['--replicas', '1', '--gpu', '1', '--cpu', '16', '--memory', '81920']
 }
@@ -73,13 +81,13 @@ function submissionArgv(spec: Stage4ARJobSpec, mode?: 'dry-run' | 'predict-only'
     '--task_name', spec.stage,
     '--charged-group', STAGE4A_CHARGED_GROUP,
     '--restart-policy', 'never',
-    '--backoff_limit', '1',
+    '--backoff_limit', String(spec.backoff_limit ?? 1),
     '--preemptible', 'no',
     '--private-machine', STAGE4A_PRIVATE_MACHINE,
-    '--image', STAGE4A_CONTAINER_IMAGE,
-    ...resources(spec.stage),
+    '--image', spec.container_image ?? STAGE4A_CONTAINER_IMAGE,
+    ...resources(spec),
     '--mount', ...STAGE4A_MOUNTS,
-    '--set-env', `AUTODATA_STAGE4A_REQUEST=${spec.request_path}`,
+    '--set-env', `${spec.request_environment ?? 'AUTODATA_STAGE4A_REQUEST'}=${spec.request_path}`,
     ...(mode === undefined ? [] : [`--${mode}`, 'true']),
     '--', '/bin/bash', spec.script_path,
   ])

@@ -103,6 +103,7 @@ function setupController<T extends CandidateValidator>(
   validator: T,
   store = new MemoryEvolutionStore(),
   runtime = new FakeRuntime(),
+  registerBaseline = true,
 ) {
   const controller = new EvolutionController({
     store,
@@ -115,11 +116,12 @@ function setupController<T extends CandidateValidator>(
     capabilities: ['data-select', 'data-filter', 'data-order'],
     acceptance: { metric: 'accuracy' },
   })
+  if (registerBaseline) controller.registerBaseline(baselineReport())
   return { controller, runtime, validator }
 }
 
-function createController(ok = true, store = new MemoryEvolutionStore()) {
-  return setupController(new FixedValidator(ok), store)
+function createController(ok = true, store = new MemoryEvolutionStore(), registerBaseline = true) {
+  return setupController(new FixedValidator(ok), store, new FakeRuntime(), registerBaseline)
 }
 
 function submit(controller: EvolutionController, candidateId: string, version: string) {
@@ -148,7 +150,70 @@ function report(candidateId: string, baselineId: string, baselineScore: number, 
   }
 }
 
+function baselineReport(overrides: Record<string, unknown> = {}) {
+  return {
+    schema_version: EVALUATION_REPORT_SCHEMA_VERSION,
+    report_id: 'report-h0',
+    profile_id: 'bfcl',
+    candidate_id: 'h0',
+    benchmark: 'bfcl-v3',
+    split: 'B_dev' as const,
+    metric: 'accuracy',
+    score: 0.5,
+    complete: true,
+    cases_evaluated: 10,
+    cases_expected: 10,
+    ...overrides,
+  }
+}
+
 describe('EvolutionController', () => {
+  it('registers H0 without runtime activation and blocks proposals until it is durable', () => {
+    const { controller, runtime } = createController(true, new MemoryEvolutionStore(), false)
+    expect(() => submit(controller, 'candidate-one', '1')).toThrow(/registered baseline/iu)
+
+    const outcome = controller.registerBaseline(baselineReport())
+    expect(outcome.status.state.active_evaluation).toMatchObject({ candidate_id: 'h0', score: 0.5 })
+    expect(controller.store.getEvaluation('bfcl', 'report-h0')).toEqual({ report: baselineReport() })
+    expect(runtime.activated).toEqual([])
+    expect(runtime.ensured).toEqual([])
+    expect(() => submit(controller, 'candidate-one', '1')).not.toThrow()
+  })
+
+  it('replays an H0 record left before state commit and rejects conflicting replays', () => {
+    const store = new FailEvaluationCommitStore()
+    const { controller } = createController(true, store, false)
+    const baseline = baselineReport()
+    store.failNextEvaluationCommit = true
+
+    expect(() => controller.registerBaseline(baseline)).toThrow(/simulated state commit failure/)
+    expect(store.getEvaluation('bfcl', 'report-h0')).toEqual({ report: baseline })
+    expect(controller.status('bfcl').state.active_evaluation).toBeUndefined()
+
+    const restarted = new EvolutionController({
+      store,
+      validator: new FixedValidator(true),
+      runtime: new FakeRuntime(),
+    })
+    const replayed = restarted.registerBaseline(baseline)
+    expect(replayed.status.state.active_evaluation).toMatchObject({ report_id: 'report-h0', score: 0.5 })
+    expect(restarted.registerBaseline(baseline).status.state).toEqual(replayed.status.state)
+    expect(() => restarted.registerBaseline(baselineReport({ score: 0.4 }))).toThrow(/conflicts|already registered/iu)
+  })
+
+  it.each([
+    { complete: false },
+    { cases_evaluated: 9 },
+    { cases_evaluated: 0, cases_expected: 0 },
+    { split: 'B_test' },
+    { metric: 'other' },
+    { benchmark: 'other' },
+    { baseline_candidate_id: 'h0', baseline_score: 0.5 },
+  ])('rejects invalid H0 baseline report %s', (overrides) => {
+    const { controller } = createController(true, new MemoryEvolutionStore(), false)
+    expect(() => controller.registerBaseline(baselineReport(overrides))).toThrow()
+  })
+
   it('creates H0, records Host feedback, and reads the current record', () => {
     const { controller } = createController()
     const status = controller.status('bfcl')

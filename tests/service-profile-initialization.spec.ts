@@ -4,6 +4,7 @@ import AutoDataService, { DEFAULT_TASK_PROFILE, getEvolutionController } from '.
 import {
   ACCEPTANCE_POLICY_SCHEMA_VERSION,
   CANDIDATE_VALIDATION_SCHEMA_VERSION,
+  EVALUATION_REPORT_SCHEMA_VERSION,
   H0_CANDIDATE_ID,
   MemoryEvolutionStore,
   TASK_PROFILE_SCHEMA_VERSION,
@@ -36,6 +37,27 @@ const acceptingValidator: CandidateValidator = {
       plugin_version: candidate.manifest.strategy_version,
     })
   },
+}
+
+function registerBaseline(
+  controller: ReturnType<typeof getEvolutionController>,
+  profileId: string,
+  benchmark: string,
+  metric: string,
+): void {
+  controller.registerBaseline({
+    schema_version: EVALUATION_REPORT_SCHEMA_VERSION,
+    report_id: `baseline-${profileId}`,
+    profile_id: profileId,
+    candidate_id: H0_CANDIDATE_ID,
+    benchmark,
+    split: 'B_dev',
+    metric,
+    score: 0,
+    complete: true,
+    cases_evaluated: 1,
+    cases_expected: 1,
+  })
 }
 
 describe('AutoDataService profile initialization', () => {
@@ -116,7 +138,9 @@ describe('AutoDataService profile initialization', () => {
       metadata: { second: 2, first: 1 },
     }
     const firstFiber = await first.plugin(AutoDataService, { store, profiles: [profile] })
-    getEvolutionController(first).submitCandidate('bfcl', {
+    const firstController = getEvolutionController(first)
+    registerBaseline(firstController, 'bfcl', 'bfcl-v3', 'accuracy')
+    firstController.submitCandidate('bfcl', {
       candidate_id: 'candidate-one',
       strategy_version: '1',
       host_source: 'return {}',
@@ -240,6 +264,7 @@ describe('AutoDataService profile initialization', () => {
     await ctx.plugin(AutoDataService, { store, validator: acceptingValidator })
     const controller = getEvolutionController(ctx)
     controller.createProfile({ id: 'other', benchmark: 'other-fixture' })
+    registerBaseline(controller, 'default', 'autodata-fixture', 'score')
 
     const outcome = await controller.submitAndValidateCandidate('default', {
       candidate_id: 'candidate-one',

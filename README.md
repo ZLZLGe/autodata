@@ -82,7 +82,7 @@ AutoData 会创建内置的 `default` Profile：benchmark 为 `autodata-fixture`
       - id: bfcl-v4
         benchmark: bfcl-v4
         acceptance:
-          metric: accuracy
+          metric: equal_category_accuracy
         capabilities:
           - data-select
           - data-filter

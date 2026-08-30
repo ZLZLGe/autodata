@@ -17,6 +17,7 @@ import {
   normalizeEvolutionFeedback,
   normalizeTaskProfile,
   proposeCandidate,
+  registerBaselineEvaluation,
   recordEvaluation,
   recordEvolutionFeedback,
   rejectRuntimeActivation,
@@ -104,12 +105,35 @@ function validatedCandidate(
   state = createInitialEvolutionState(profile),
   candidateId?: string,
 ): { readonly state: EvolutionState; readonly manifest: CandidateManifest } {
-  const candidateManifest = manifest(profile, state, candidateId)
-  const proposed = proposeCandidate(profile, state, candidateManifest)
+  const ready = state.active_evaluation === undefined
+    ? registerBaselineEvaluation(profile, state, baselineReport(profile))
+    : state
+  const candidateManifest = manifest(profile, ready, candidateId)
+  const proposed = proposeCandidate(profile, ready, candidateManifest)
   return Object.freeze({
     state: validateCandidate(proposed, candidateManifest.candidate_id),
     manifest: candidateManifest,
   })
+}
+
+function baselineReport(
+  profile: TaskProfile,
+  overrides: Partial<EvaluationReport> = {},
+): EvaluationReport {
+  return {
+    schema_version: EVALUATION_REPORT_SCHEMA_VERSION,
+    report_id: 'report-h0',
+    profile_id: profile.id,
+    candidate_id: H0_CANDIDATE_ID,
+    benchmark: profile.benchmark,
+    split: 'B_dev',
+    metric: profile.acceptance_policy.metric,
+    score: 0.5,
+    complete: true,
+    cases_evaluated: 10,
+    cases_expected: 10,
+    ...overrides,
+  }
 }
 
 function evaluationReport(
@@ -133,15 +157,22 @@ function evaluationReport(
     cases_expected: 10,
     ...(includeBaseline ? {
       baseline_candidate_id: state.active_candidate_id,
-      baseline_score: state.active_evaluation?.score ?? 0.5,
+      baseline_score: state.active_evaluation!.score,
     } : {}),
     ...overrides,
   }
 }
 
 function persistCandidate(store: EvolutionStore, profile: TaskProfile, state: EvolutionState, candidateId = 'candidate-1') {
-  const candidateManifest = manifest(profile, state, candidateId)
-  const proposed = proposeCandidate(profile, state, candidateManifest)
+  let ready = state
+  if (ready.active_evaluation === undefined) {
+    const report = baselineReport(profile)
+    ready = registerBaselineEvaluation(profile, ready, report)
+    store.saveEvaluation(profile.id, { report })
+    store.saveState(ready)
+  }
+  const candidateManifest = manifest(profile, ready, candidateId)
+  const proposed = proposeCandidate(profile, ready, candidateManifest)
   store.saveCandidate(candidatePackage(candidateManifest))
   store.saveState(proposed)
   return { manifest: candidateManifest, state: proposed }
@@ -172,12 +203,72 @@ describe('Stage 3 profile and candidate contracts', () => {
 })
 
 describe('Stage 3 state and strict B_dev decisions', () => {
+  it('registers a complete H0 baseline while preserving feedback and rejects invalid baseline reports', () => {
+    const profile = taskProfile()
+    const initial = createInitialEvolutionState(profile)
+    const currentFeedback = feedback(profile, initial)
+    const withFeedback = recordEvolutionFeedback(initial, currentFeedback)
+    const report = baselineReport(profile)
+    const registered = registerBaselineEvaluation(profile, withFeedback, report)
+
+    expect(registered).toMatchObject({
+      generation: 0,
+      active_candidate_id: H0_CANDIDATE_ID,
+      open_candidate_id: null,
+      active_evaluation: { report_id: report.report_id, candidate_id: H0_CANDIDATE_ID, score: 0.5 },
+      feedback_ids: [currentFeedback.feedback_id],
+      current_feedback_id: currentFeedback.feedback_id,
+    })
+    expect(registerBaselineEvaluation(profile, registered, report)).toEqual(registered)
+
+    const invalidReports: EvaluationReport[] = [
+      baselineReport(profile, { candidate_id: 'candidate-1' }),
+      baselineReport(profile, { complete: false }),
+      baselineReport(profile, { cases_evaluated: 9 }),
+      baselineReport(profile, { cases_evaluated: 0, cases_expected: 0 }),
+      baselineReport(profile, { split: 'B_test' }),
+      baselineReport(profile, { metric: 'other' }),
+      baselineReport(profile, { benchmark: 'other' }),
+      baselineReport(profile, { baseline_candidate_id: H0_CANDIDATE_ID, baseline_score: 0.5 }),
+    ]
+    for (const invalid of invalidReports) {
+      expect(() => registerBaselineEvaluation(profile, initial, invalid)).toThrow()
+    }
+  })
+
+  it('requires a durable active baseline before proposing or comparing H1', () => {
+    const profile = taskProfile()
+    const initial = createInitialEvolutionState(profile)
+    const candidateManifest = manifest(profile, initial)
+    expect(() => proposeCandidate(profile, initial, candidateManifest)).toThrow(/registered baseline/iu)
+
+    const legacyOpen = validateEvolutionState({
+      ...initial,
+      open_candidate_id: candidateManifest.candidate_id,
+      candidates: [...initial.candidates, {
+        candidate_id: candidateManifest.candidate_id,
+        generation: candidateManifest.generation,
+        status: 'validated',
+        parent_candidate_id: H0_CANDIDATE_ID,
+      }],
+    })
+    expect(decideEvaluation(profile, legacyOpen, {
+      ...baselineReport(profile),
+      report_id: `report-${candidateManifest.candidate_id}`,
+      candidate_id: candidateManifest.candidate_id,
+      score: 0.6,
+      baseline_candidate_id: H0_CANDIDATE_ID,
+      baseline_score: -100,
+    })).toMatchObject({ accepted: false, reason: 'baseline_missing' })
+  })
+
   it('accepts a strict improvement and can roll back to the source-less H0 baseline', () => {
     const profile = taskProfile()
     const initial = createInitialEvolutionState(profile)
     const h0Feedback = feedback(profile, initial, 'feedback-h0')
     const withFeedback = recordEvolutionFeedback(initial, h0Feedback)
-    const validated = validatedCandidate(profile, withFeedback)
+    const baseline = registerBaselineEvaluation(profile, withFeedback, baselineReport(profile))
+    const validated = validatedCandidate(profile, baseline)
     const report = evaluationReport(profile, validated.state, validated.manifest.candidate_id)
     const accepted = recordEvaluation(profile, validated.state, report)
 
@@ -195,7 +286,7 @@ describe('Stage 3 state and strict B_dev decisions', () => {
     const withCandidateFeedback = recordEvolutionFeedback(accepted.state, candidateFeedback)
     const rolledBack = rollbackCandidate(withCandidateFeedback, H0_CANDIDATE_ID)
     expect(rolledBack.active_candidate_id).toBe(H0_CANDIDATE_ID)
-    expect(rolledBack.active_evaluation).toBeUndefined()
+    expect(rolledBack.active_evaluation).toMatchObject({ candidate_id: H0_CANDIDATE_ID, score: 0.5 })
     expect(rolledBack.feedback_ids).toEqual(['feedback-h0', 'feedback-candidate'])
     expect(rolledBack.current_feedback_id).toBeNull()
     expect(rolledBack.candidates.find(value => value.candidate_id === validated.manifest.candidate_id)?.status)
@@ -283,7 +374,8 @@ describe('Stage 3 state and strict B_dev decisions', () => {
     const initial = createInitialEvolutionState(profile)
     expect(() => validateEvolutionState({ ...initial, candidates: [] })).toThrow(/H0|non-empty/)
 
-    const proposed = proposeCandidate(profile, initial, manifest(profile, initial))
+    const baseline = registerBaselineEvaluation(profile, initial, baselineReport(profile))
+    const proposed = proposeCandidate(profile, baseline, manifest(profile, baseline))
     const badLineage = structuredClone(proposed) as unknown as { candidates: Array<Record<string, unknown>> }
     badLineage.candidates[1]!.generation = 3
     expect(() => validateEvolutionState(badLineage)).toThrow(/parent generation/)
@@ -304,11 +396,11 @@ describe('Stage 3 state and strict B_dev decisions', () => {
     expect(() => validateEvolutionState(badOpenParent)).toThrow(/parent generation|directly descend/)
 
     expect(() => validateEvolutionState({
-      ...initial,
+      ...baseline,
       feedback_ids: ['feedback-1', 'feedback-1'],
     })).toThrow(/duplicate feedback/)
     expect(() => validateEvolutionState({
-      ...initial,
+      ...baseline,
       current_feedback_id: 'feedback-missing',
     })).toThrow(/current_feedback_id/)
   })
@@ -319,7 +411,11 @@ describe('Stage 3 persistence consistency', () => {
     const profile = taskProfile()
 
     const missingSourceStore = new MemoryEvolutionStore()
-    const missingState = missingSourceStore.createProfile(profile)
+    const missingInitial = missingSourceStore.createProfile(profile)
+    const missingBaselineReport = baselineReport(profile)
+    const missingState = registerBaselineEvaluation(profile, missingInitial, missingBaselineReport)
+    missingSourceStore.saveEvaluation(profile.id, { report: missingBaselineReport })
+    missingSourceStore.saveState(missingState)
     const missingManifest = manifest(profile, missingState)
     missingSourceStore.saveState(proposeCandidate(profile, missingState, missingManifest))
     expect(() => missingSourceStore.loadConsistentSnapshot(profile.id)).toThrow(/no persisted host source/)
@@ -401,6 +497,72 @@ describe('Stage 3 persistence consistency', () => {
     })).toThrow(/already exists/)
   })
 
+  it('persists decisionless H0 records and fails closed on missing or contradictory references', () => {
+    const profile = taskProfile()
+    const fileDirectory = mkdtempSync(join(tmpdir(), 'autodata-evolution-'))
+    temporaryDirectories.push(fileDirectory)
+
+    for (const store of [new MemoryEvolutionStore(), new FileEvolutionStore(fileDirectory)]) {
+      const initial = store.createProfile(profile)
+      const report = baselineReport(profile)
+      const registered = registerBaselineEvaluation(profile, initial, report)
+      store.saveEvaluation(profile.id, { report })
+      store.saveState(registered)
+      expect(store.loadConsistentSnapshot(profile.id).evaluation_records).toEqual([{ report }])
+    }
+
+    const missingStore = new MemoryEvolutionStore()
+    const missingInitial = missingStore.createProfile(profile)
+    missingStore.saveState(registerBaselineEvaluation(profile, missingInitial, baselineReport(profile)))
+    expect(() => missingStore.loadConsistentSnapshot(profile.id)).toThrow(/evaluation.*missing/iu)
+
+    const mismatchStore = new MemoryEvolutionStore()
+    const mismatchInitial = mismatchStore.createProfile(profile)
+    const expected = baselineReport(profile)
+    mismatchStore.saveEvaluation(profile.id, { report: { ...expected, score: 0.4 } })
+    mismatchStore.saveState(registerBaselineEvaluation(profile, mismatchInitial, expected))
+    expect(() => mismatchStore.loadConsistentSnapshot(profile.id)).toThrow(/does not match state/iu)
+
+    const decidedStore = new MemoryEvolutionStore()
+    const decidedInitial = decidedStore.createProfile(profile)
+    const decidedReport = baselineReport(profile)
+    decidedStore.saveEvaluation(profile.id, {
+      report: decidedReport,
+      decision: {
+        candidate_id: H0_CANDIDATE_ID,
+        accepted: false,
+        reason: 'baseline_missing',
+        split: 'B_dev',
+        metric: 'accuracy',
+        candidate_score: 0.5,
+      },
+    })
+    decidedStore.saveState(registerBaselineEvaluation(profile, decidedInitial, decidedReport))
+    expect(() => decidedStore.loadConsistentSnapshot(profile.id)).toThrow(/H0 baseline evaluation.*invalid/iu)
+
+    const orphanStore = new MemoryEvolutionStore()
+    orphanStore.createProfile(profile)
+    orphanStore.saveEvaluation(profile.id, { report: baselineReport(profile) })
+    expect(orphanStore.loadConsistentSnapshot(profile.id).evaluation_records).toEqual([])
+  })
+
+  it('fails closed when a File Store baseline record is corrupt', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'autodata-evolution-'))
+    temporaryDirectories.push(directory)
+    const store = new FileEvolutionStore(directory)
+    const profile = taskProfile()
+    const initial = store.createProfile(profile)
+    const report = baselineReport(profile)
+    store.saveEvaluation(profile.id, { report })
+    store.saveState(registerBaselineEvaluation(profile, initial, report))
+    writeFileSync(
+      join(directory, 'profiles', profile.id, 'runs', report.report_id, 'summary.json'),
+      '{ broken',
+      'utf8',
+    )
+    expect(() => store.loadConsistentSnapshot(profile.id)).toThrow(/strict JSON|corrupt/iu)
+  })
+
   it('applies the same strict run_id rule and run uniqueness in both Stores', () => {
     const profile = taskProfile()
     const stores: EvolutionStore[] = [new MemoryEvolutionStore()]
@@ -439,9 +601,11 @@ describe('Stage 3 persistence consistency', () => {
     store.saveCandidate(orphanCandidate)
     const orphanFeedback = feedback(profile, state, 'feedback-orphan')
     store.saveFeedback(orphanFeedback)
+    store.saveEvaluation(profile.id, { report: baselineReport(profile) })
     expect(store.loadConsistentSnapshot(profile.id)).toMatchObject({
       candidate_packages: [],
       feedback_records: [],
+      evaluation_records: [],
     })
     expect(() => store.saveCandidate(orphanCandidate)).toThrow(/already exists/)
     expect(() => store.saveFeedback(orphanFeedback)).toThrow(/already exists/)

@@ -19,7 +19,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import AutoDataService, { getEvolutionController } from '../src/service.js'
 import * as AutoDataTool from '../src/tool.js'
 import { MemoryEvolutionStore } from '../src/evolution/store.js'
-import { EVOLUTION_FEEDBACK_SCHEMA_VERSION } from '../src/evolution/types.js'
+import { EVALUATION_REPORT_SCHEMA_VERSION, EVOLUTION_FEEDBACK_SCHEMA_VERSION } from '../src/evolution/types.js'
 import { ProcessCandidateValidator } from '../src/evolution/validator.js'
 
 const contexts: Context[] = []
@@ -142,6 +142,19 @@ describe('Stage 3B DSH Agent loop', () => {
     expect(process.env.DSH_TOOLS_MODE).toBe('native')
     const { ctx, adapter } = await setup()
     const controller = getEvolutionController(ctx)
+    controller.registerBaseline({
+      schema_version: EVALUATION_REPORT_SCHEMA_VERSION,
+      report_id: 'report-h0',
+      profile_id: 'agent-profile',
+      candidate_id: 'h0',
+      benchmark: 'fixture',
+      split: 'B_dev',
+      metric: 'accuracy',
+      score: 0.5,
+      complete: true,
+      cases_evaluated: 1,
+      cases_expected: 1,
+    })
     controller.recordFeedback({
       schema_version: EVOLUTION_FEEDBACK_SCHEMA_VERSION,
       feedback_id: 'feedback-agent-loop',

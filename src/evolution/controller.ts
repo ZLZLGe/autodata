@@ -23,6 +23,7 @@ import {
 } from './profile.js'
 import {
   proposeCandidate,
+  registerBaselineEvaluation,
   recordEvaluation as transitionEvaluation,
   recordEvolutionFeedback,
   rejectCandidate,
@@ -67,6 +68,11 @@ export interface EvaluationOutcome {
   readonly status: EvolutionStatus
 }
 
+export interface BaselineOutcome {
+  readonly report: EvaluationReport
+  readonly status: EvolutionStatus
+}
+
 export interface EvolutionControllerOptions {
   readonly store: EvolutionStore
   readonly validator: CandidateValidator
@@ -102,6 +108,43 @@ export class EvolutionController {
     }
     this.store.createProfile(profile)
     return this.status(profile.id)
+  }
+
+  /** Persist and commit the formal H0 B_dev baseline without touching runtime state. */
+  registerBaseline(reportInput: EvaluationReport): BaselineOutcome {
+    this.assertUsable()
+    const report = normalizeEvaluationReport(reportInput)
+    const snapshot = this.store.loadConsistentSnapshot(report.profile_id)
+    const h0 = snapshot.state.candidates.find(candidate => candidate.candidate_id === H0_CANDIDATE_ID)
+    const existing = this.store.getEvaluation(report.profile_id, report.report_id)
+
+    if (h0?.evaluation !== undefined) {
+      if (h0.evaluation.report_id !== report.report_id) {
+        throw new EvolutionError('H0 baseline is already registered', 'CANDIDATE_STATE', {
+          profile_id: report.profile_id,
+          candidate_id: report.candidate_id,
+        })
+      }
+      this.assertMatchingBaselineRecord(report, existing)
+      if (existing === undefined) {
+        throw new EvolutionError(`committed H0 baseline ${report.report_id} has no durable record`, 'STATE_CORRUPT', {
+          profile_id: report.profile_id,
+          candidate_id: report.candidate_id,
+        })
+      }
+      return Object.freeze({ report, status: this.status(report.profile_id) })
+    }
+
+    this.assertMatchingBaselineRecord(report, existing)
+    const next = registerBaselineEvaluation(snapshot.profile, snapshot.state, report)
+    this.store.saveEvaluation(report.profile_id, { report })
+    try {
+      this.store.saveState(next)
+    } catch (error) {
+      this.restoreState(snapshot.state)
+      throw error
+    }
+    return Object.freeze({ report, status: this.status(report.profile_id) })
   }
 
   /**
@@ -545,6 +588,25 @@ export class EvolutionController {
     }
     if (record.decision === undefined) {
       throw new EvolutionError(`evaluation ${report.report_id} has no durable decision`, 'STATE_CORRUPT', {
+        profile_id: report.profile_id,
+        candidate_id: report.candidate_id,
+      })
+    }
+  }
+
+  private assertMatchingBaselineRecord(
+    report: EvaluationReport,
+    record: EvaluationRecord | undefined,
+  ): void {
+    if (record === undefined) return
+    if (canonicalJson(record.report) !== canonicalJson(report)) {
+      throw new EvolutionError(`baseline evaluation ${report.report_id} conflicts with its durable record`, 'INVALID_EVALUATION', {
+        profile_id: report.profile_id,
+        candidate_id: report.candidate_id,
+      })
+    }
+    if (record.decision !== undefined) {
+      throw new EvolutionError(`baseline evaluation ${report.report_id} cannot contain a decision`, 'INVALID_EVALUATION', {
         profile_id: report.profile_id,
         candidate_id: report.candidate_id,
       })

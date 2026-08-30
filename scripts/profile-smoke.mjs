@@ -120,6 +120,14 @@ try {
   }
 
   const probe = join(scratch, 'probe.mjs')
+  const installedEntry = pathToFileURL(join(
+    profileDirectory,
+    'node_modules',
+    '@zlzlge',
+    'autodata',
+    'lib',
+    'index.js',
+  )).href
   const candidateSource = `
     return {
       inject: ['autodata'],
@@ -136,6 +144,7 @@ try {
   `
   writeFileSync(probe, [
     "import { writeFileSync } from 'node:fs'",
+    `import { EVALUATION_REPORT_SCHEMA_VERSION, H0_CANDIDATE_ID, getEvolutionController } from ${JSON.stringify(installedEntry)}`,
     "export const name = 'autodata-smoke-probe'",
     "export const inject = ['autodata', 'loader', 'tools']",
     'export function apply(ctx) {',
@@ -153,6 +162,19 @@ try {
     '    const schemaNames = ctx.tools.schemas().map(schema => schema.name)',
     "    const evolutionStatus = await execute('autodata_evolution_status', { profile_id: 'default' }, 'profile-status')",
     "    const evolutionFeedback = await execute('autodata_evolution_feedback', { profile_id: 'default' }, 'profile-feedback')",
+    '    const baseline = getEvolutionController(ctx).registerBaseline({',
+    '      schema_version: EVALUATION_REPORT_SCHEMA_VERSION,',
+    "      report_id: 'default-smoke-h0-baseline',",
+    "      profile_id: 'default',",
+    '      candidate_id: H0_CANDIDATE_ID,',
+    "      benchmark: 'autodata-fixture',",
+    "      split: 'B_dev',",
+    "      metric: 'score',",
+    '      score: 0,',
+    '      complete: true,',
+    '      cases_evaluated: 1,',
+    '      cases_expected: 1,',
+    '    })',
     "    const candidate = await execute('autodata_submit_candidate', {",
     "      profile_id: 'default',",
     "      candidate_id: 'default-smoke-candidate',",
@@ -162,7 +184,7 @@ try {
     "    }, 'profile-candidate')",
     '    if (!active) return',
     '    writeFileSync(process.env.AUTODATA_SMOKE_READY, JSON.stringify({',
-    '      status, plugins, context, schemaNames, evolutionStatus, evolutionFeedback, candidate,',
+    '      status, plugins, context, schemaNames, evolutionStatus, evolutionFeedback, baseline, candidate,',
     '    }))',
     '  }).catch(error => {',
     '    writeFileSync(process.env.AUTODATA_SMOKE_READY, JSON.stringify({',
@@ -223,6 +245,9 @@ try {
   }
   if (observed.evolutionFeedback?.isError || observed.evolutionFeedback?.value?.feedback !== null) {
     throw new Error(`default evolution feedback failed: ${JSON.stringify(observed.evolutionFeedback)}`)
+  }
+  if (observed.baseline?.status?.state?.active_evaluation?.candidate_id !== 'h0') {
+    throw new Error(`default H0 baseline registration failed: ${JSON.stringify(observed.baseline)}`)
   }
   if (observed.candidate?.isError || observed.candidate?.value?.validation?.ok !== true) {
     throw new Error(`default candidate validation failed: ${JSON.stringify(observed.candidate)}`)

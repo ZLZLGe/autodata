@@ -230,6 +230,7 @@ export interface EvolutionSnapshot {
   readonly state: EvolutionState
   readonly candidate_packages: readonly CandidatePackage[]
   readonly feedback_records: readonly EvolutionFeedback[]
+  readonly evaluation_records: readonly EvaluationRecord[]
 }
 
 /** Synchronous Store contract used by the Stage 3 controller. */

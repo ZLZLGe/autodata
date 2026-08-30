@@ -57,6 +57,19 @@ describe('Stage 3A full lifecycle', () => {
     expect('evolution' in ctx.autodata).toBe(false)
     const first = getEvolutionController(ctx)
     first.createProfile({ id: 'bfcl', benchmark: 'bfcl-v3', acceptance: { metric: 'accuracy' } })
+    first.registerBaseline({
+      schema_version: EVALUATION_REPORT_SCHEMA_VERSION,
+      report_id: 'report-h0',
+      profile_id: 'bfcl',
+      candidate_id: 'h0',
+      benchmark: 'bfcl-v3',
+      split: 'B_dev',
+      metric: 'accuracy',
+      score: 0.5,
+      complete: true,
+      cases_evaluated: 10,
+      cases_expected: 10,
+    })
 
     const validated = await first.submitAndValidateCandidate('bfcl', {
       candidate_id: 'candidate-one',
@@ -104,7 +117,9 @@ describe('Stage 3A full lifecycle', () => {
 
     await resumed.resume('bfcl', agent)
     expect(ctx.autodata.plugins()).toContainEqual({ id: 'bfcl-strategy', version: '1' })
-    expect((await resumed.rollback('bfcl', 'h0', agent)).state.active_candidate_id).toBe('h0')
+    const rolledBack = await resumed.rollback('bfcl', 'h0', agent)
+    expect(rolledBack.state.active_candidate_id).toBe('h0')
+    expect(rolledBack.state.active_evaluation).toMatchObject({ report_id: 'report-h0', score: 0.5 })
     expect(ctx.autodata.plugins()).toEqual([{ id: 'toolcall-h0', version: '3' }])
   })
 

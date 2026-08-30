@@ -1,0 +1,74 @@
+{
+  "manifest_version": "autodata-stage4b-bfcl-bundle-manifest-1",
+  "bfcl": {
+    "source_commit": "6ea57973c7a6097fd7c5915698c54c17c5b1b6c8",
+    "source_files": {
+      "simple_python": {
+        "question": "bfcl_eval/data/BFCL_v4_simple_python.json",
+        "question_sha256": "82dd63ba502eb2520c6b5d1d9a5c4b590e03ff261565175561f6228a367d1991",
+        "possible_answer": "bfcl_eval/data/possible_answer/BFCL_v4_simple_python.json",
+        "possible_answer_sha256": "90cd5bc653690ee8e459b5b3f3fc9458606f7f3fcbf795bb51b7dc581f8c86dc"
+      },
+      "multiple": {
+        "question": "bfcl_eval/data/BFCL_v4_multiple.json",
+        "question_sha256": "aef168155ebd74b7ac2401198b201343bc7d16d7a3d7e0d4e6d8ee82c6969b2a",
+        "possible_answer": "bfcl_eval/data/possible_answer/BFCL_v4_multiple.json",
+        "possible_answer_sha256": "244e00ce9395df948bcafc7bee64e8f9c87ef70887587d83cae45b13699f3047"
+      },
+      "parallel": {
+        "question": "bfcl_eval/data/BFCL_v4_parallel.json",
+        "question_sha256": "19f51a82eff42e5d62541aa500115a056eb78f437c2ba1f10415fd7c8e5dda84",
+        "possible_answer": "bfcl_eval/data/possible_answer/BFCL_v4_parallel.json",
+        "possible_answer_sha256": "8a6aa19c1adddc6a5a2f7e40f9dbf30cc7e95815e7b830c90589ab318229e0f0"
+      },
+      "parallel_multiple": {
+        "question": "bfcl_eval/data/BFCL_v4_parallel_multiple.json",
+        "question_sha256": "8863ea8433239f55c5f016154cf0830853c89f693c6ea270396a2fa121960579",
+        "possible_answer": "bfcl_eval/data/possible_answer/BFCL_v4_parallel_multiple.json",
+        "possible_answer_sha256": "5ebf24f458c1f16300c05505d83d6f0a1b68b79be273a033febd0d4f840507e3"
+      },
+      "irrelevance": {
+        "question": "bfcl_eval/data/BFCL_v4_irrelevance.json",
+        "question_sha256": "2b6ed4c2e992cdcf5f1678a701851f944bef7550ee026ed1ddb89efed5be01a6",
+        "possible_answer": null,
+        "possible_answer_sha256": null
+      }
+    },
+    "parent_split_manifest_sha256": "48c91d1d4191f2242ecea91b5e4094fc6cd13c7f1bf217761c33a03aadcf41fb"
+  },
+  "selection": {
+    "path": "selection.json",
+    "sha256": "899f2170343b2ebbeaa15263c73f45fe7a57ac74c04d0eed8864b034dbcec450",
+    "algorithm": "take the five lowest SHA-256 ranks per split and category; rank input is UTF-8 decimal seed, NUL, split, NUL, category, NUL, case ID; ties use case ID",
+    "seed": 20260823,
+    "cases_per_category": 5
+  },
+  "bundles": {
+    "search": {
+      "path": "search.jsonl",
+      "records": 25,
+      "category_counts": {
+        "simple_python": 5,
+        "multiple": 5,
+        "parallel": 5,
+        "parallel_multiple": 5,
+        "irrelevance": 5
+      },
+      "bytes": 32707,
+      "sha256": "a355b2e1137f7203e420bf80b75e822f3fc8747a2c89cbc1d1aa129b5c633d12"
+    },
+    "dev": {
+      "path": "dev.jsonl",
+      "records": 25,
+      "category_counts": {
+        "simple_python": 5,
+        "multiple": 5,
+        "parallel": 5,
+        "parallel_multiple": 5,
+        "irrelevance": 5
+      },
+      "bytes": 30127,
+      "sha256": "ae88ed88291b26e2aee549ac634662bc05e2848182df81ba8bd8b62732e2679e"
+    }
+  }
+}

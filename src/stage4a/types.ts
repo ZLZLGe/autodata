@@ -212,6 +212,16 @@ export interface Stage4ARJobSpec {
   readonly staging_directory: string
   readonly script_path: string
   readonly request_path: string
+  /** Optional generic experiment overrides; Stage 4A always uses the defaults. */
+  readonly request_environment?: string
+  readonly resources?: {
+    readonly gpu: number
+    readonly cpu: number
+    readonly memory_mib: number
+  }
+  readonly container_image?: string
+  /** Kubernetes-level task retries. The H-cluster requires a positive value. */
+  readonly backoff_limit?: number
 }
 
 export type Stage4ARemoteStatus = 'missing' | 'pending' | 'running' | 'succeeded' | 'failed' | 'stopped'

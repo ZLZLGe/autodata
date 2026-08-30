@@ -21,6 +21,11 @@ import {
   type TaskProfile,
   type TaskProfileInput,
 } from './evolution/types.js'
+import { ExperimentController } from './experiment/controller.js'
+import {
+  ExperimentError,
+  type ExperimentControllerOptions,
+} from './experiment/types.js'
 import { Stage4AController } from './stage4a/controller.js'
 import type {
   Stage4AControllerOptions,
@@ -75,6 +80,8 @@ export interface AutoDataServiceOptions {
   readonly runtime?: EvolutionRuntime
   /** Host-only Stage 4A paths and test seams; never exposed through ctx.autodata. */
   readonly stage4a?: Stage4AControllerOptions
+  /** Host-only Stage 4B paths and test seams; the Evolution controller is always injected here. */
+  readonly experiment?: Omit<ExperimentControllerOptions, 'evolution'>
 }
 
 /** The zero-configuration profile used only when the Store is initially empty. */
@@ -106,6 +113,7 @@ const AUTO_DATA_SERVICE_CONFIG = {
 
 const evolutionControllers = new WeakMap<AutoDataService, EvolutionController>()
 const stage4AControllers = new WeakMap<AutoDataService, Stage4AController>()
+const experimentControllers = new WeakMap<AutoDataService, ExperimentController>()
 const CORDIS_ORIGINAL = Symbol.for('cordis.original')
 
 function originalAutoDataService(service: AutoDataService): AutoDataService {
@@ -133,6 +141,18 @@ export function getStage4AController(ctx: Context): Stage4AController {
     : stage4AControllers.get(originalAutoDataService(service))
   if (controller === undefined) {
     throw new EvolutionError('AutoData Stage 4A controller is unavailable', 'RUNTIME_UNAVAILABLE')
+  }
+  return controller
+}
+
+/** Trusted Host accessor. Experiments are deliberately absent from ctx.autodata and model tools. */
+export function getExperimentController(ctx: Context): ExperimentController {
+  const service = ctx.get('autodata', false) as AutoDataService | undefined
+  const controller = service === undefined
+    ? undefined
+    : experimentControllers.get(originalAutoDataService(service))
+  if (controller === undefined) {
+    throw new ExperimentError('AutoData experiment controller is unavailable', 'DEPENDENCY_UNAVAILABLE')
   }
   return controller
 }
@@ -199,6 +219,19 @@ export class AutoDataService extends Service {
         stage4AControllers.delete(originalAutoDataService(this))
       }
     }, 'autodata.stage4a-controller')
+
+    const experiment = new ExperimentController(ctx, {
+      ...options.experiment,
+      evolution: controller,
+    })
+    experimentControllers.set(originalAutoDataService(this), experiment)
+    this.ctx.effect(() => async () => {
+      try {
+        await experiment.dispose()
+      } finally {
+        experimentControllers.delete(originalAutoDataService(this))
+      }
+    }, 'autodata.experiment-controller')
   }
 
   /** Return deterministic in-memory status without reading project or run data. */
@@ -321,7 +354,7 @@ function normalizeServiceOptions(value: unknown): AutoDataServiceOptions {
     throw new TypeError('AutoData service config must be an object')
   }
   const input = value as Record<string, unknown>
-  const allowed = new Set(['profiles', 'store', 'validator', 'runtime', 'stage4a'])
+  const allowed = new Set(['profiles', 'store', 'validator', 'runtime', 'stage4a', 'experiment'])
   const extra = Object.keys(input).find(key => !allowed.has(key))
   if (extra !== undefined) throw new TypeError(`AutoData service config has unsupported field ${extra}`)
 
@@ -347,6 +380,9 @@ function normalizeServiceOptions(value: unknown): AutoDataServiceOptions {
     ...(input.validator === undefined ? {} : { validator: input.validator as CandidateValidator }),
     ...(input.runtime === undefined ? {} : { runtime: input.runtime as EvolutionRuntime }),
     ...(input.stage4a === undefined ? {} : { stage4a: input.stage4a as Stage4AControllerOptions }),
+    ...(input.experiment === undefined
+      ? {}
+      : { experiment: input.experiment as Omit<ExperimentControllerOptions, 'evolution'> }),
   }
 }
 

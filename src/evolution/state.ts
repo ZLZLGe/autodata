@@ -169,6 +169,9 @@ export function proposeCandidate(
   const state = validateEvolutionState(stateInput)
   assertProfileOwnsState(profile, state)
   const manifest = validateCandidateForProfile(profile, manifestInput)
+  if (state.active_evaluation === undefined) {
+    fail('the active candidate must have a registered baseline before proposing a candidate', 'CANDIDATE_STATE', state, manifest.candidate_id)
+  }
   if (manifest.profile_id !== state.profile_id) {
     fail('candidate profile_id does not match EvolutionState', 'INVALID_CANDIDATE', state, manifest.candidate_id)
   }
@@ -194,6 +197,67 @@ export function proposeCandidate(
       parent_candidate_id: manifest.parent_candidate_id,
     }],
   })
+}
+
+/** Register the complete formal B_dev evaluation for the built-in H0 baseline. */
+export function registerBaselineEvaluation(
+  profileInput: TaskProfileInput | TaskProfile,
+  stateInput: EvolutionState,
+  reportInput: EvaluationReport,
+): EvolutionState {
+  const profile = normalizeTaskProfile(profileInput)
+  const state = validateEvolutionState(stateInput)
+  assertProfileOwnsState(profile, state)
+  const report = normalizeEvaluationReport(reportInput)
+  if (report.profile_id !== state.profile_id) {
+    fail('baseline EvaluationReport profile_id does not match EvolutionState', 'INVALID_EVALUATION', state, report.candidate_id)
+  }
+  if (report.candidate_id !== H0_CANDIDATE_ID) {
+    fail('baseline EvaluationReport must target H0', 'INVALID_EVALUATION', state, report.candidate_id)
+  }
+  if (
+    state.active_candidate_id !== H0_CANDIDATE_ID
+    || state.generation !== 0
+    || state.open_candidate_id !== null
+  ) {
+    fail('H0 baseline can only be registered while H0 is active with no open candidate', 'CANDIDATE_STATE', state, report.candidate_id)
+  }
+  if (
+    !report.complete
+    || report.cases_evaluated === undefined
+    || report.cases_expected === undefined
+    || report.cases_expected <= 0
+    || report.cases_evaluated !== report.cases_expected
+  ) {
+    fail('H0 baseline requires a complete evaluation with all expected cases', 'INVALID_EVALUATION', state, report.candidate_id)
+  }
+  if (
+    report.benchmark !== profile.benchmark
+    || report.split !== profile.acceptance_policy.split
+    || report.metric !== profile.acceptance_policy.metric
+  ) {
+    fail('H0 baseline does not match the TaskProfile evaluation policy', 'INVALID_EVALUATION', state, report.candidate_id)
+  }
+  if (report.baseline_candidate_id !== undefined || report.baseline_score !== undefined) {
+    fail('H0 baseline EvaluationReport cannot contain baseline fields', 'INVALID_EVALUATION', state, report.candidate_id)
+  }
+  const summary = reportSummary(report)
+  const h0 = requireCandidate(state, H0_CANDIDATE_ID)
+  if (h0.evaluation !== undefined) {
+    if (
+      h0.evaluation.report_id === summary.report_id
+      && h0.evaluation.candidate_id === summary.candidate_id
+      && h0.evaluation.benchmark === summary.benchmark
+      && h0.evaluation.split === summary.split
+      && h0.evaluation.metric === summary.metric
+      && h0.evaluation.score === summary.score
+    ) return state
+    fail('H0 baseline is already registered', 'CANDIDATE_STATE', state, report.candidate_id)
+  }
+  return replaceCandidate(state, H0_CANDIDATE_ID, candidate => ({
+    ...candidate,
+    evaluation: summary,
+  }), { active_evaluation: summary })
 }
 
 /** Promote a successfully isolated candidate from proposed to validated. */
@@ -263,6 +327,11 @@ export function decideEvaluation(
   if (report.metric !== policy.metric) return decision(candidate.candidate_id, false, 'wrong_metric', report)
   if (report.benchmark !== profile.benchmark) return decision(candidate.candidate_id, false, 'wrong_benchmark', report)
 
+  const activeEvaluation = state.active_evaluation
+  if (activeEvaluation === undefined) {
+    return decision(candidate.candidate_id, false, 'baseline_missing', report)
+  }
+
   const hasBaselineId = report.baseline_candidate_id !== undefined
   const hasBaselineScore = report.baseline_score !== undefined
   if (hasBaselineId !== hasBaselineScore) {
@@ -272,26 +341,17 @@ export function decideEvaluation(
     return decision(candidate.candidate_id, false, 'baseline_candidate_mismatch', report)
   }
 
-  const activeEvaluation = state.active_evaluation
-  let baselineScore: number
-  if (activeEvaluation === undefined) {
-    if (report.baseline_score === undefined) {
-      return decision(candidate.candidate_id, false, 'baseline_missing', report)
-    }
-    baselineScore = report.baseline_score
-  } else {
-    if (
-      activeEvaluation.candidate_id !== state.active_candidate_id
-      || activeEvaluation.benchmark !== profile.benchmark
-      || activeEvaluation.split !== policy.split
-      || activeEvaluation.metric !== policy.metric
-    ) {
-      return decision(candidate.candidate_id, false, 'baseline_missing', report)
-    }
-    baselineScore = activeEvaluation.score
-    if (report.baseline_score !== undefined && report.baseline_score !== baselineScore) {
-      return decision(candidate.candidate_id, false, 'baseline_score_mismatch', report, baselineScore)
-    }
+  if (
+    activeEvaluation.candidate_id !== state.active_candidate_id
+    || activeEvaluation.benchmark !== profile.benchmark
+    || activeEvaluation.split !== policy.split
+    || activeEvaluation.metric !== policy.metric
+  ) {
+    return decision(candidate.candidate_id, false, 'baseline_missing', report)
+  }
+  const baselineScore = activeEvaluation.score
+  if (report.baseline_score !== undefined && report.baseline_score !== baselineScore) {
+    return decision(candidate.candidate_id, false, 'baseline_score_mismatch', report, baselineScore)
   }
   if (!(report.score > baselineScore)) {
     return decision(candidate.candidate_id, false, 'not_strictly_better', report, baselineScore)
