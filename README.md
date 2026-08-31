@@ -17,14 +17,14 @@ AutoData 是为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harne
 
 阶段二保持纯内存、单进程、同步模型；Stage 3A 已增加持久化 Controller、
 直接 JavaScript DataPlugin 提案、普通 Node 子进程验证、B_dev 接受/回滚和
-重启恢复；Stage 3B 已用确定性 fake model 和真实 FreeRouter 模型分别驱动
+重启恢复；Stage 3B 已用确定性 fake model 和当时的真实模型路由分别驱动
 DSH Agent/Session/Tool loop，并验证直接候选提交，Gate 3 已完成。Python 训练
 和 GPU 评测由 [Stage 4A 兼容性闸门](docs/stage4a-gpu-gate.md) 接管；控制面与
 离线测试已实现，正式 H200 train/eval 已于 2026-08-30 通过，Gate 4A 已完成。
 Stage 4B 的 16-step H₀ 正式基线及 50-case BFCL 评测也已完成，B_dev 五类
-等权 macro 为 0.8。Stage 4C 的原 FreeRouter run 在候选生成前因 provider
-基础设施错误终止；其证据保持不变，当前通过追加式 PJLAB recovery 继续同一个
-逻辑 H₁。详细实验记录与 artifact 证据保存在项目飞书实验台账。
+等权 macro 为 0.8。旧 FreeRouter/PJLAB Stage 4C 尝试均在候选生成前终止，
+其历史证据仍保留在 `/data` 和项目飞书实验台账；当前代码已切换为独立的
+GetElucid Responses 探索性运行入口，尚未发出正式 proposal，也尚未训练 H₁。
 
 ## 阶段二（Gate 2 已完成）
 
@@ -63,8 +63,8 @@ Stage 3A/3B 按 [docs/stage3-evolution.md](docs/stage3-evolution.md) 实现：Au
 DataPlugin 候选、B_search 反馈、子进程验证、B_dev 接受/拒绝、回滚和重启
 恢复。生产 Bundle 使用 `AUTODATA_HOME`，未设置时回退到
 `$DSH_HOME/autodata`；两者都缺失时会明确失败。强模型复用当前 DSH Profile
-的 Agent、Session、Tool 和模型，直接提交 `host_source`；确定性 loop 与真实
-FreeRouter smoke 均已通过。训练、评测和 GPU 作业通过 DSH `ctx.jobs` 在
+的 Agent、Session、Tool 和模型，直接提交 `host_source`；确定性 loop 与历史
+真实模型 smoke 均已通过。训练、评测和 GPU 作业通过 DSH `ctx.jobs` 在
 Stage 4 接入。
 
 ### TaskProfile 初始化
@@ -123,49 +123,27 @@ pnpm check
 
 `pnpm test:profile` 会在临时目录中构建包 tarball，将其安装到隔离的 DSH Profile（配置档案）中，验证服务和工具，并确认关闭时能够干净销毁。它不会调用模型 API。
 
-真实模型 smoke 是显式选择加入的本地检查，不属于 `pnpm check`：
+Stage 4C 当前 Evolver 路由固定使用 GetElucid 的 OpenAI Responses 接口：
+`POST https://hk.getelucid.com/v1/responses`，模型为 `gpt-5.6-sol`。凭据只通过
+`GETELUCID_API_KEY` 环境变量引用，代码不提供 `/models`、Chat Completions、
+额外 smoke 或 fallback 入口。DSH/pi-ai 的最终 wire、SSE 解析和零 SDK retry
+由 `pnpm check` 中的离线 mocked-fetch 测试覆盖，不消耗真实调用预算。
+
+普通 first-H₁ runner 使用独立的新 run 身份。`start` 会先校验冻结 H₀ 和
+Evolution 状态；实际 proposal context 的哈希与本次 manifest 会在持久化请求
+reservation 后、调用 Provider 前写入。正式请求属于后续 Stage 4C 执行阶段：
 
 ```sh
-FREEROUTER_API_KEY=... pnpm smoke:freerouter
+GETELUCID_API_KEY=... pnpm stage4c:first-h1 start
+GETELUCID_API_KEY=... pnpm stage4c:first-h1 resume
+pnpm stage4c:first-h1 status
 ```
 
-该命令通过 DSH 的 `llm-pi-ai`、Agent、Session 和 Tool loop 调用固定的
-`free-router/gpt-5.6-sol` 路由，从 synthetic B_search 反馈生成并验证一个
-DataPlugin 候选。凭据只通过 `FREEROUTER_API_KEY` 环境变量引用；脚本不读取
-`auth.json`。变量缺失或为空时命令会在加载 Agent/模型适配器之前跳过并以 0
-退出，不会发出网络请求。普通 `pnpm check` 只做离线配置和跳过路径验证，不能
-据此声称真实模型 smoke 已通过。若进程环境设置了标准 `HTTP_PROXY`、
-`HTTPS_PROXY` 或小写等价项，smoke 会让 Node 请求遵循这些代理及 `NO_PROXY`；
-代理地址和凭据都不会写入结果。DSH 的默认有限重试策略会处理瞬时超时、限流和
-传输错误。失败只打印脱敏后的稳定错误码与消息；成功 JSON 会记录工具调用顺序、
-候选状态和版本、实际启动的重试次数，以及所有 provider attempt 已报告的汇总
-token usage。
-
-Stage 4C 当前 Evolver 路由使用 PJLAB 的 OpenAI-compatible Chat Completions
-接口；独立的连通性检查为：
-
-```sh
-PJLAB_API_KEY=... pnpm smoke:pjlab
-```
-
-该检查固定调用 `pjlab/glm-5.3-flash`，通过真实 DSH Agent loop 验证 SSE 与
-Stage 4C 使用的 `max_tokens=16384`，但只发送无候选上下文的 `Reply with
-exactly OK.`。密钥只从 `PJLAB_API_KEY` 读取，不写入配置或结果；它不创建
-generation、candidate 或 experiment，也不计作正式 H₁ 草稿。成功摘要会明确
-报告实际 provider attempt 与 retry 数量。
-
-正式恢复先在无模型请求的 `prepare` 步骤中校验原失败 run、冻结 H₀、
-Evolution 状态和模型可见上下文，并创建唯一、追加式协议修订；之后才允许启动：
-
-```sh
-pnpm stage4c:first-h1 prepare
-PJLAB_API_KEY=... pnpm stage4c:first-h1 start
-PJLAB_API_KEY=... pnpm stage4c:first-h1 resume
-```
-
-恢复 generation 使用独立的
-`/data/codex-work/autodata/runs/generation-recoveries/stage4c-pjlab-01`
-根目录；原 FreeRouter claim、run 和三次失败 response 不会被删除或改写。
+新 generation 使用
+`/data/codex-work/autodata/runs/generations/stage4c-getelucid-01`
+根目录。每个 run 只有一次 proposal 配额；reservation 在模型边界前持久化，
+结果不明确时 resume 会消费该配额而不会重发。旧 Provider 的活跃配置、探针和
+recovery runner 已移除，但 `/data` 中的历史产物不会被删除或改写。
 
 ## 安装本地候选版本
 

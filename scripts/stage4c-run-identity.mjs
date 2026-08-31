@@ -1,7 +1,7 @@
 import { lstatSync, readFileSync } from 'node:fs'
 import { isAbsolute, relative, resolve, sep } from 'node:path'
 
-export const FIRST_H1_CLAIM_SCHEMA_VERSION = 'autodata-first-h1-claim-1'
+export const FIRST_H1_CLAIM_SCHEMA_VERSION = 'autodata-first-h1-claim-2'
 export const FIRST_H1_CLAIM_FILE = 'first-h1-claim.json'
 
 const COMMIT = /^[a-f0-9]{40}$/u
@@ -14,7 +14,9 @@ const CLAIM_FIELDS = Object.freeze([
   'experiment_run_id',
   'candidate_id',
   'execution_commit',
+  'max_proposal_drafts',
 ])
+const MAX_PROPOSAL_DRAFTS = 3
 
 function assertCommit(commit) {
   if (typeof commit !== 'string' || !COMMIT.test(commit)) {
@@ -81,7 +83,7 @@ function identity(commit, date) {
   })
 }
 
-function parseClaim(path, expectedProfileId, expectedCommit) {
+function parseClaim(path, expectedProfileId, expectedCommit, expectedMaxProposalDrafts) {
   let value
   try {
     value = JSON.parse(readFileSync(path, 'utf8'))
@@ -100,6 +102,14 @@ function parseClaim(path, expectedProfileId, expectedCommit) {
   }
   if (value.schema_version !== FIRST_H1_CLAIM_SCHEMA_VERSION) {
     throw new Error('durable first-H1 claim has an unsupported schema')
+  }
+  if (
+    !Number.isSafeInteger(value.max_proposal_drafts)
+    || value.max_proposal_drafts < 1
+    || value.max_proposal_drafts > MAX_PROPOSAL_DRAFTS
+  ) throw new Error('durable first-H1 claim max_proposal_drafts is invalid')
+  if (value.max_proposal_drafts !== expectedMaxProposalDrafts) {
+    throw new Error('durable first-H1 claim has a different proposal budget')
   }
   if (value.profile_id !== expectedProfileId) {
     throw new Error('durable first-H1 claim belongs to a different profile')
@@ -140,12 +150,23 @@ export function hongKongRunDate(now = new Date()) {
 }
 
 /** Resolve stable IDs from the durable claim, or mint today's IDs before the claim exists. */
-export function resolveStage4CExecutionIdentity({ generationRunRoot, profileId, commit, now = new Date() }) {
+export function resolveStage4CExecutionIdentity({
+  generationRunRoot,
+  profileId,
+  commit,
+  maxProposalDrafts,
+  now = new Date(),
+}) {
   const normalizedCommit = assertCommit(commit)
   const normalizedProfileId = assertProfileId(profileId)
+  if (
+    !Number.isSafeInteger(maxProposalDrafts)
+    || maxProposalDrafts < 1
+    || maxProposalDrafts > MAX_PROPOSAL_DRAFTS
+  ) throw new Error('formal Stage 4C proposal budget is invalid')
   const path = claimPath(generationRunRoot, normalizedProfileId)
   if (inspectExistingPath(path, 'durable first-H1 claim', 'file')) {
-    return parseClaim(path, normalizedProfileId, normalizedCommit)
+    return parseClaim(path, normalizedProfileId, normalizedCommit, maxProposalDrafts)
   }
   return identity(normalizedCommit, hongKongRunDate(now))
 }

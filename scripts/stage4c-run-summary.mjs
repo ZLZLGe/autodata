@@ -7,7 +7,7 @@ export function summarizeStage4CExecution({
   provider,
   model,
   profileId,
-  protocolAmendment,
+  runManifest,
 }) {
   const closedLoop = state.status === 'succeeded' && state.phase === 'complete' && state.decision !== undefined
   const outcome = !closedLoop
@@ -21,13 +21,15 @@ export function summarizeStage4CExecution({
     operation,
     provider,
     model,
-    same_logical_h1: true,
-    protocol_amendment: {
-      amendment_id: protocolAmendment.id,
-      sha256: protocolAmendment.sha256,
-      path: protocolAmendment.path,
-      original_generation_run_id: protocolAmendment.originalGenerationRunId,
-    },
+    exploratory: true,
+    run_manifest: runManifest === undefined
+      ? null
+      : {
+          path: runManifest.path,
+          sha256: runManifest.sha256,
+          proposal_context_sha256: runManifest.manifest.proposal.context_sha256,
+          source_pool_sha256: runManifest.manifest.h0.source_pool_sha256,
+        },
     execution_commit: execution.commit,
     execution_commit_short: execution.short_commit,
     profile_id: profileId,
@@ -37,6 +39,8 @@ export function summarizeStage4CExecution({
     status: state.status,
     phase: state.phase,
     draft_attempts: state.attempts.length,
+    max_proposal_drafts: state.max_proposal_drafts,
+    proposal_drafts_started: state.proposal_drafts_started,
     failed_drafts: state.attempts.filter(attempt => attempt.status === 'failed').length,
     formal_candidate_persisted: state.formal_candidate_persisted,
     experiment_started: state.experiment_started === true,

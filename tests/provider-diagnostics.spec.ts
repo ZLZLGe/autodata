@@ -2,16 +2,16 @@ import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { describe, expect, it } from 'vitest'
 
-interface SmokeDiagnosticsModule {
+interface ProviderDiagnosticsModule {
   diagnostic(error: unknown, secrets?: readonly unknown[]): string
   formatTurnEndReason(reason: unknown, secrets?: readonly unknown[]): string
   sanitizeDiagnosticText(value: unknown, secrets?: readonly unknown[]): string
 }
 
-const moduleUrl = pathToFileURL(join(process.cwd(), 'scripts/smoke-diagnostics.mjs')).href
-const diagnostics = await import(moduleUrl) as SmokeDiagnosticsModule
+const moduleUrl = pathToFileURL(join(process.cwd(), 'scripts/provider-diagnostics.mjs')).href
+const diagnostics = await import(moduleUrl) as ProviderDiagnosticsModule
 
-describe('FreeRouter smoke diagnostics', () => {
+describe('provider diagnostics', () => {
   it('reports completed and missing turn outcomes without inspecting other event data', () => {
     expect(diagnostics.formatTurnEndReason({ kind: 'completed' })).toBe('completed')
     expect(diagnostics.formatTurnEndReason(undefined)).toBe('missing')
@@ -35,7 +35,7 @@ describe('FreeRouter smoke diagnostics', () => {
   })
 
   it('redacts configured and conventionally formatted credentials', () => {
-    const secret = 'freerouter-test-secret'
+    const secret = 'provider-test-secret'
     const text = diagnostics.formatTurnEndReason({
       kind: 'error',
       error: {

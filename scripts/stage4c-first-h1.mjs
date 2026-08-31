@@ -1,31 +1,46 @@
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { realpathSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  fsyncSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  realpathSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { setTimeout as delay } from 'node:timers/promises'
 import { dirname, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { isDeepStrictEqual } from 'node:util'
 import {
-  PJLAB_API_KEY_ENV,
-  PJLAB_MODEL,
-  PJLAB_PROVIDER,
-  assertPjlabConfig,
-  createPjlabLlmConfig,
-  hasPjlabApiKey,
-} from './pjlab-config.mjs'
-import { diagnostic } from './smoke-diagnostics.mjs'
-import { installEnvironmentProxy } from './smoke-proxy.mjs'
-import {
-  STAGE4C_ORIGINAL_EXECUTION,
-  createStage4CRecoveryAmendment,
-  verifyStage4CRecoveryAmendment,
-} from './stage4c-recovery-amendment.mjs'
+  GETELUCID_API,
+  GETELUCID_API_KEY_ENV,
+  GETELUCID_BASE_URL,
+  GETELUCID_MODEL,
+  GETELUCID_PROVIDER,
+  assertGetElucidConfig,
+  createGetElucidLlmConfig,
+  hasGetElucidApiKey,
+} from './getelucid-config.mjs'
+import { diagnostic } from './provider-diagnostics.mjs'
+import { installEnvironmentProxy } from './provider-proxy.mjs'
+import { resolveStage4CExecutionIdentity } from './stage4c-run-identity.mjs'
 import { summarizeStage4CExecution } from './stage4c-run-summary.mjs'
 
 const PROJECT_ROOT = realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), '..'))
 const AUTODATA_HOME = '/data/codex-work/autodata/evolution'
-const ORIGINAL_GENERATION_RUN_ROOT = '/data/codex-work/autodata/runs/generations'
-const GENERATION_RUN_ROOT = '/data/codex-work/autodata/runs/generation-recoveries/stage4c-pjlab-01'
+export const STAGE4C_GETELUCID_GENERATION_ROOT = '/data/codex-work/autodata/runs/generations/stage4c-getelucid-01'
+export const STAGE4C_GETELUCID_MANIFEST_FILE = resolve(STAGE4C_GETELUCID_GENERATION_ROOT, 'run-manifest.json')
+export const STAGE4C_GETELUCID_LOCK_FILE = '/data/codex-work/autodata/runs/.stage4c-getelucid-01.lock'
 const EXPERIMENT_RUN_ROOT = '/data/codex-work/autodata/runs/experiments'
 const EXPERIMENT_STAGING_ROOT = '/mnt/shared-storage-user/gezhilong/autodata/staging/experiments'
 const H0_RUN_ID = 'h0-f058c05bd893-20260830'
@@ -35,63 +50,61 @@ const H0_CONTRACT_SHA256 = '8d610144f31275f2264e5c959dee1de8dca401d7e50a3425dab0
 const H0_FEEDBACK_ID = 'h0-search-0f39b730fc5af5a756bc'
 const H0_EVALUATION_REPORT_ID = 'h0-dev-0f39b730fc5af5a756bc'
 const H0_BASELINE_SCORE = 0.8
+const H0_SOURCE_POOL_SHA256 = 'c5c57f65bb58ddecf4d83d576a0fc7341153933bab2ce9b9596b20f9496a9db4'
 const B_SEARCH_CASES_JSONL = resolve(PROJECT_ROOT, 'stage4b/bfcl/search.jsonl')
 const EXPERIMENT_ASSET_ROOT = resolve(PROJECT_ROOT, 'stage4b')
 const COMMON_WORKER_ROOT = resolve(PROJECT_ROOT, 'stage4a/python/autodata_stage4a')
 const PROFILE_ID = 'bfcl-v4'
 const STRATEGY_VERSION = '1'
+const MAX_PROPOSAL_DRAFTS = 1
+const MAX_PROVIDER_REQUESTS = 1
+const PROVIDER_RETRY_MAX = 0
+const MAX_TOKENS = 16_384
 const POLL_INTERVAL_MS = 10_000
 const TERMINAL_STATUSES = new Set(['succeeded', 'failed', 'cancelled', 'recovery_required'])
-const COMMANDS = new Set(['prepare', 'auto', 'start', 'resume', 'status'])
+const COMMANDS = new Set(['start', 'resume', 'status'])
+let manifestTemporarySequence = 0
 
-const command = process.argv[2] ?? 'auto'
-if (command === '--help' || command === '-h') {
-  console.log('Usage: node scripts/stage4c-first-h1.mjs [prepare|auto|start|resume|status]')
-} else if (!COMMANDS.has(command) || process.argv.length > 3) {
-  console.error('Usage: node scripts/stage4c-first-h1.mjs [prepare|auto|start|resume|status]')
-  process.exitCode = 64
-} else {
-  try {
-    const result = await run(command)
-    console.log(JSON.stringify(result.summary))
-    if (command !== 'status' && command !== 'prepare') {
-      if (result.summary.status === 'recovery_required') process.exitCode = 2
-      else if (result.summary.status !== 'succeeded') process.exitCode = 1
+const invokedAsMain = process.argv[1] !== undefined
+  && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)
+if (invokedAsMain) {
+  const command = process.argv[2]
+  if (command === '--help' || command === '-h') {
+    console.log('Usage: node scripts/stage4c-first-h1.mjs [start|resume|status]')
+  } else if (!COMMANDS.has(command) || process.argv.length !== 3) {
+    console.error('Usage: node scripts/stage4c-first-h1.mjs [start|resume|status]')
+    process.exitCode = 64
+  } else {
+    try {
+      const result = await run(command)
+      console.log(JSON.stringify(result.summary))
+      if (command !== 'status') {
+        if (result.summary.status === 'recovery_required') process.exitCode = 2
+        else if (result.summary.status !== 'succeeded') process.exitCode = 1
+      }
+    } catch (error) {
+      console.error(`Stage 4C first-H1 entry failed: ${diagnostic(error, secrets())}`)
+      process.exitCode = 1
     }
-  } catch (error) {
-    console.error(`Stage 4C first-H1 entry failed: ${diagnostic(error, secrets())}`)
-    process.exitCode = 1
   }
 }
 
 async function run(requestedCommand) {
-  const git = formalGitIdentity()
-  preflightEvidenceBoundary()
-  const protocol = requestedCommand === 'prepare'
-    ? createStage4CRecoveryAmendment(recoveryOptions(git.commit))
-    : verifyStage4CRecoveryAmendment(recoveryOptions(git.commit))
-  const execution = recoveryExecution(protocol.amendment, git)
-  const amendmentSha256 = createHash('sha256').update(readFileSync(protocol.path)).digest('hex')
-  if (requestedCommand === 'prepare') {
-    return {
-      summary: Object.freeze({
-        schema_version: 'autodata-stage4c-recovery-preparation-1',
-        status: 'prepared',
-        amendment_created: protocol.created,
-        amendment_path: protocol.path,
-        amendment_sha256: amendmentSha256,
-        same_logical_h1: true,
-        original_generation_run_id: STAGE4C_ORIGINAL_EXECUTION.generation_run_id,
-        recovery_generation_run_id: execution.generation_run_id,
-        recovery_experiment_run_id: execution.experiment_run_id,
-        recovery_candidate_id: execution.candidate_id,
-        execution_commit: execution.commit,
-        provider: PJLAB_PROVIDER,
-        model: PJLAB_MODEL,
-        b_test_touched: false,
-      }),
-    }
+  const lock = requestedCommand === 'start' || requestedCommand === 'resume'
+    ? acquireStage4CExecutionLock()
+    : undefined
+  try {
+    return await runWithLock(requestedCommand)
+  } finally {
+    lock?.dispose()
   }
+}
+
+async function runWithLock(requestedCommand) {
+  const execution = formalExecutionIdentity()
+  preflightEvidenceBoundary()
+  const existingManifest = readStage4CRunManifest(execution)
+  assertStage4CCredential(requestedCommand)
   process.env.AUTODATA_HOME = AUTODATA_HOME
   process.env.DSH_TOOLS_MODE = 'native'
 
@@ -99,14 +112,13 @@ async function run(requestedCommand) {
   let disposeEnvironmentProxy
   try {
     disposeEnvironmentProxy = await installEnvironmentProxy()
-    const llmConfig = createPjlabLlmConfig()
-    assertPjlabConfig(llmConfig)
+    const llmConfig = createGetElucidLlmConfig()
+    assertGetElucidConfig(llmConfig)
     const [
       { Context },
       { default: AgentRegistry },
       { default: AgentLoop },
       LlmPiAi,
-      LlmRetry,
       { default: LlmRuntime },
       { default: SessionStore },
       { default: SystemPrompt },
@@ -114,12 +126,12 @@ async function run(requestedCommand) {
       { default: LocalJobRegistry },
       { default: LocalSubprocessRuntime },
       { default: AutoDataService, getEvolutionController, getGenerationController },
+      { DshGenerationProposer },
     ] = await Promise.all([
       import('@deepseek-ai/cordis'),
       import('@deepseek-ai/dsh-agent'),
       import('@deepseek-ai/dsh-agent-loop'),
       import('@deepseek-ai/dsh-llm-pi-ai'),
-      import('@deepseek-ai/dsh-llm-retry'),
       import('@deepseek-ai/dsh-llm'),
       import('@deepseek-ai/dsh-session'),
       import('@deepseek-ai/dsh-system-prompt'),
@@ -127,6 +139,7 @@ async function run(requestedCommand) {
       import('@deepseek-ai/dsh-jobs-local'),
       import('@deepseek-ai/dsh-subprocess-local'),
       import('../lib/service.js'),
+      import('../lib/generation/index.js'),
     ])
 
     ctx = new Context()
@@ -136,9 +149,18 @@ async function run(requestedCommand) {
     await ctx.plugin(LlmPiAi, llmConfig)
     await ctx.plugin(SessionStore)
     await ctx.plugin(AgentRegistry)
-    await ctx.plugin(LlmRetry)
+    // Deliberately omit dsh-llm-retry. The provider profile also declares
+    // maxRetries=0, so the one proposal slot maps to one Responses request.
     await ctx.plugin(LocalSubprocessRuntime)
     await ctx.plugin(LocalJobRegistry)
+    const proposer = createManifestingProposer(
+      new DshGenerationProposer(ctx, {
+        provider: GETELUCID_PROVIDER,
+        model: GETELUCID_MODEL,
+        max_tokens: MAX_TOKENS,
+      }),
+      execution,
+    )
     await ctx.plugin(AutoDataService, {
       experiment: {
         run_root: EXPERIMENT_RUN_ROOT,
@@ -147,15 +169,25 @@ async function run(requestedCommand) {
         common_worker_root: COMMON_WORKER_ROOT,
       },
       generation: {
-        run_root: GENERATION_RUN_ROOT,
-        expected_proposal_context_sha256: protocol.amendment.evidence_sha256.proposal_context,
+        run_root: STAGE4C_GETELUCID_GENERATION_ROOT,
+        proposer,
+        ...(existingManifest === undefined
+          ? {}
+          : { expected_proposal_context_sha256: existingManifest.manifest.proposal.context_sha256 }),
       },
     })
     await ctx.plugin(AgentLoop, { agents: [] })
 
     const evolution = getEvolutionController(ctx)
     const profile = evolution.status(PROFILE_ID).profile
-    if (profile.id !== PROFILE_ID || profile.benchmark !== 'bfcl-v4') {
+    if (
+      profile.id !== PROFILE_ID
+      || profile.benchmark !== 'bfcl-v4'
+      || profile.acceptance_policy?.rule !== 'strict_improvement'
+      || profile.acceptance_policy.split !== 'B_dev'
+      || profile.acceptance_policy.metric !== 'equal_category_accuracy'
+      || profile.acceptance_policy.direction !== 'maximize'
+    ) {
       throw new Error('the durable bfcl-v4 TaskProfile does not match the formal Stage 4C target')
     }
     const controller = getGenerationController(ctx)
@@ -163,14 +195,18 @@ async function run(requestedCommand) {
     if (existing !== undefined && existing.state.execution_commit !== execution.commit) {
       throw new Error('existing Stage 4C generation is bound to a different full Git commit')
     }
-    const operation = resolveOperation(requestedCommand, existing?.state.status)
-    if ((operation === 'start' || operation === 'resume') && !hasPjlabApiKey()) {
-      throw new Error(`${PJLAB_API_KEY_ENV} is required for ${operation}`)
+    if (existing !== undefined && existing.state.max_proposal_drafts !== MAX_PROPOSAL_DRAFTS) {
+      throw new Error('existing Stage 4C generation has a different proposal budget')
     }
 
     let status
-    if (operation === 'start') status = controller.start(startRequest(execution))
-    else if (operation === 'resume') status = controller.resume(PROFILE_ID, execution.generation_run_id)
+    if (requestedCommand === 'start') {
+      if (existing !== undefined) throw new Error(`generation ${PROFILE_ID}/${execution.generation_run_id} already exists`)
+      status = controller.start(createStage4CStartRequest(execution))
+    } else if (requestedCommand === 'resume') {
+      if (existing === undefined) throw new Error(`generation ${PROFILE_ID}/${execution.generation_run_id} does not exist`)
+      status = controller.resume(PROFILE_ID, execution.generation_run_id)
+    }
     else {
       if (existing === undefined) {
         throw new Error(`generation ${PROFILE_ID}/${execution.generation_run_id} does not exist`)
@@ -178,24 +214,20 @@ async function run(requestedCommand) {
       status = existing
     }
 
-    if (operation !== 'status' && status.job_id !== undefined) {
+    if (requestedCommand !== 'status' && status.job_id !== undefined) {
       status = await pollUntilSettled(controller, status, execution)
     }
+    const manifest = readStage4CRunManifest(execution)
     return {
       summary: summarizeStage4CExecution({
         requestedCommand,
-        operation,
+        operation: requestedCommand,
         state: status.state,
         execution,
-        provider: PJLAB_PROVIDER,
-        model: PJLAB_MODEL,
+        provider: GETELUCID_PROVIDER,
+        model: GETELUCID_MODEL,
         profileId: PROFILE_ID,
-        protocolAmendment: {
-          id: protocol.amendment.amendment_id,
-          sha256: amendmentSha256,
-          path: protocol.path,
-          originalGenerationRunId: STAGE4C_ORIGINAL_EXECUTION.generation_run_id,
-        },
+        runManifest: manifest,
       }),
     }
   } finally {
@@ -204,7 +236,7 @@ async function run(requestedCommand) {
   }
 }
 
-function startRequest(execution) {
+export function createStage4CStartRequest(execution) {
   return Object.freeze({
     profile_id: PROFILE_ID,
     run_id: execution.generation_run_id,
@@ -214,6 +246,7 @@ function startRequest(execution) {
     b_search_cases_jsonl: B_SEARCH_CASES_JSONL,
     candidate_id: execution.candidate_id,
     strategy_version: STRATEGY_VERSION,
+    max_proposal_drafts: MAX_PROPOSAL_DRAFTS,
   })
 }
 
@@ -224,15 +257,6 @@ function generationStatusOrUndefined(controller, execution) {
     if (isErrorCode(error, 'RUN_NOT_FOUND')) return undefined
     throw error
   }
-}
-
-function resolveOperation(requestedCommand, existingStatus) {
-  if (requestedCommand !== 'auto') return requestedCommand
-  if (existingStatus === undefined) return 'start'
-  if (existingStatus === 'failed' || existingStatus === 'cancelled') return 'status'
-  // Replaying a completed ledger is intentional: it verifies that a fresh
-  // process can reconcile the durable accepted/rejected decision and runtime.
-  return 'resume'
 }
 
 async function pollUntilSettled(controller, initialStatus, execution) {
@@ -262,7 +286,7 @@ async function pollUntilSettled(controller, initialStatus, execution) {
   }
 }
 
-function formalGitIdentity() {
+function formalExecutionIdentity() {
   let repositoryRoot
   let commit
   let status
@@ -289,39 +313,246 @@ function formalGitIdentity() {
   if (forbidden.length > 0) {
     throw new Error(`formal Stage 4C requires a clean tracked/untracked tree; forbidden entries: ${forbidden.join(', ')}`)
   }
-  return Object.freeze({ commit, short_commit: commit.slice(0, 12) })
-}
-
-function recoveryOptions(recoveryCommit) {
-  return Object.freeze({
-    originalGenerationRoot: ORIGINAL_GENERATION_RUN_ROOT,
-    recoveryGenerationRoot: GENERATION_RUN_ROOT,
-    experimentRunRoot: EXPERIMENT_RUN_ROOT,
-    experimentStagingRoot: EXPERIMENT_STAGING_ROOT,
-    evolutionRoot: AUTODATA_HOME,
-    recoveryCommit,
-    provider: PJLAB_PROVIDER,
-    model: PJLAB_MODEL,
+  return resolveStage4CExecutionIdentity({
+    generationRunRoot: STAGE4C_GETELUCID_GENERATION_ROOT,
+    profileId: PROFILE_ID,
+    commit,
+    maxProposalDrafts: MAX_PROPOSAL_DRAFTS,
   })
 }
 
-function recoveryExecution(amendment, git) {
-  const recovery = amendment?.recovery_execution
-  if (
-    recovery?.execution_commit !== git.commit
-    || recovery.provider !== PJLAB_PROVIDER
-    || recovery.model !== PJLAB_MODEL
-    || recovery.generation_root !== GENERATION_RUN_ROOT
-    || typeof recovery.generation_run_id !== 'string'
-    || typeof recovery.experiment_run_id !== 'string'
-    || typeof recovery.candidate_id !== 'string'
-  ) throw new Error('Stage 4C recovery amendment identity does not match the current execution')
+export function assertStage4CCredential(command, environment = process.env) {
+  if ((command === 'start' || command === 'resume') && !hasGetElucidApiKey(environment)) {
+    throw new Error(`${GETELUCID_API_KEY_ENV} is required for ${command}; no network request was made`)
+  }
+}
+
+export function acquireStage4CExecutionLock(lockPath = STAGE4C_GETELUCID_LOCK_FILE) {
+  const path = resolve(lockPath)
+  if (path !== lockPath) throw new Error('Stage 4C lock path must be absolute and normalized')
+  const parent = dirname(path)
+  const parentStat = lstatSync(parent)
+  if (parentStat.isSymbolicLink() || !parentStat.isDirectory() || realpathSync(parent) !== parent) {
+    throw new Error('Stage 4C lock parent must be one real directory')
+  }
+  let descriptor
+  try {
+    descriptor = openSync(path, constants.O_CREAT | constants.O_RDWR | (constants.O_NOFOLLOW ?? 0), 0o600)
+    const opened = fstatSync(descriptor)
+    if (!opened.isFile()) throw new Error('Stage 4C lock must be a regular file')
+    const outcome = spawnSync('/usr/bin/flock', ['--exclusive', '--nonblock', '3'], {
+      stdio: ['ignore', 'ignore', 'ignore', descriptor],
+    })
+    if (outcome.error !== undefined) throw outcome.error
+    if (outcome.status !== 0) throw new Error('another Stage 4C start/resume process holds the execution lock')
+  } catch (error) {
+    if (descriptor !== undefined) closeSync(descriptor)
+    throw error
+  }
+  let disposed = false
   return Object.freeze({
-    commit: git.commit,
-    short_commit: git.short_commit,
-    generation_run_id: recovery.generation_run_id,
-    experiment_run_id: recovery.experiment_run_id,
-    candidate_id: recovery.candidate_id,
+    path,
+    dispose: () => {
+      if (disposed) return
+      disposed = true
+      closeSync(descriptor)
+    },
+  })
+}
+
+export function createStage4CRunManifest(execution, proposalContext) {
+  if (proposalContext?.profile_id !== PROFILE_ID) {
+    throw new Error('Stage 4C proposal context belongs to a different profile')
+  }
+  if (
+    proposalContext?.source_pool?.canonical_jsonl_sha256 !== H0_SOURCE_POOL_SHA256
+    || !/^[a-f0-9]{64}$/u.test(proposalContext.source_pool.canonical_jsonl_sha256)
+  ) throw new Error('Stage 4C proposal context source pool differs from frozen H0')
+  const proposalContextSha256 = sha256(`${canonicalJson(proposalContext)}\n`)
+  const manifest = {
+    schema_version: 'autodata-stage4c-getelucid-run-manifest-1',
+    exploratory: true,
+    profile_id: PROFILE_ID,
+    generation_run_id: execution.generation_run_id,
+    experiment_run_id: execution.experiment_run_id,
+    candidate_id: execution.candidate_id,
+    execution_commit: execution.commit,
+    provider: {
+      id: GETELUCID_PROVIDER,
+      api: GETELUCID_API,
+      base_url: GETELUCID_BASE_URL,
+      endpoint: `${GETELUCID_BASE_URL}/responses`,
+      model: GETELUCID_MODEL,
+      api_key_env: GETELUCID_API_KEY_ENV,
+    },
+    h0: {
+      run_id: H0_RUN_ID,
+      contract_id: H0_CONTRACT_ID,
+      contract_sha256: H0_CONTRACT_SHA256,
+      source_pool_sha256: H0_SOURCE_POOL_SHA256,
+    },
+    proposal: {
+      context_sha256: proposalContextSha256,
+      max_proposal_drafts: MAX_PROPOSAL_DRAFTS,
+      max_provider_requests: MAX_PROVIDER_REQUESTS,
+      provider_retry_max: PROVIDER_RETRY_MAX,
+    },
+    acceptance: {
+      rule: 'strict_improvement',
+      split: 'B_dev',
+      metric: 'equal_category_accuracy',
+      direction: 'maximize',
+      baseline_score: H0_BASELINE_SCORE,
+    },
+  }
+  assertStage4CRunManifest(manifest, execution)
+  return deepFreeze(manifest)
+}
+
+export function assertStage4CRunManifest(value, execution) {
+  const manifest = requireExactRecord(value, [
+    'schema_version',
+    'exploratory',
+    'profile_id',
+    'generation_run_id',
+    'experiment_run_id',
+    'candidate_id',
+    'execution_commit',
+    'provider',
+    'h0',
+    'proposal',
+    'acceptance',
+  ], 'Stage 4C run manifest')
+  assertManifestEqual(manifest.schema_version, 'autodata-stage4c-getelucid-run-manifest-1', 'schema_version')
+  assertManifestEqual(manifest.exploratory, true, 'exploratory')
+  assertManifestEqual(manifest.profile_id, PROFILE_ID, 'profile_id')
+  assertManifestEqual(manifest.generation_run_id, execution.generation_run_id, 'generation_run_id')
+  assertManifestEqual(manifest.experiment_run_id, execution.experiment_run_id, 'experiment_run_id')
+  assertManifestEqual(manifest.candidate_id, execution.candidate_id, 'candidate_id')
+  assertManifestEqual(manifest.execution_commit, execution.commit, 'execution_commit')
+
+  const provider = requireExactRecord(manifest.provider, [
+    'id', 'api', 'base_url', 'endpoint', 'model', 'api_key_env',
+  ], 'Stage 4C run manifest provider')
+  assertManifestEqual(provider.id, GETELUCID_PROVIDER, 'provider.id')
+  assertManifestEqual(provider.api, GETELUCID_API, 'provider.api')
+  assertManifestEqual(provider.base_url, GETELUCID_BASE_URL, 'provider.base_url')
+  assertManifestEqual(provider.endpoint, `${GETELUCID_BASE_URL}/responses`, 'provider.endpoint')
+  assertManifestEqual(provider.model, GETELUCID_MODEL, 'provider.model')
+  assertManifestEqual(provider.api_key_env, GETELUCID_API_KEY_ENV, 'provider.api_key_env')
+
+  const h0 = requireExactRecord(manifest.h0, [
+    'run_id', 'contract_id', 'contract_sha256', 'source_pool_sha256',
+  ], 'Stage 4C run manifest H0')
+  assertManifestEqual(h0.run_id, H0_RUN_ID, 'h0.run_id')
+  assertManifestEqual(h0.contract_id, H0_CONTRACT_ID, 'h0.contract_id')
+  assertManifestEqual(h0.contract_sha256, H0_CONTRACT_SHA256, 'h0.contract_sha256')
+  assertManifestEqual(h0.source_pool_sha256, H0_SOURCE_POOL_SHA256, 'h0.source_pool_sha256')
+
+  const proposal = requireExactRecord(manifest.proposal, [
+    'context_sha256', 'max_proposal_drafts', 'max_provider_requests', 'provider_retry_max',
+  ], 'Stage 4C run manifest proposal')
+  if (typeof proposal.context_sha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(proposal.context_sha256)) {
+    throw new Error('Stage 4C run manifest proposal.context_sha256 must be lowercase SHA-256')
+  }
+  assertManifestEqual(proposal.max_proposal_drafts, MAX_PROPOSAL_DRAFTS, 'proposal.max_proposal_drafts')
+  assertManifestEqual(proposal.max_provider_requests, MAX_PROVIDER_REQUESTS, 'proposal.max_provider_requests')
+  assertManifestEqual(proposal.provider_retry_max, PROVIDER_RETRY_MAX, 'proposal.provider_retry_max')
+
+  const acceptance = requireExactRecord(manifest.acceptance, [
+    'rule', 'split', 'metric', 'direction', 'baseline_score',
+  ], 'Stage 4C run manifest acceptance')
+  assertManifestEqual(acceptance.rule, 'strict_improvement', 'acceptance.rule')
+  assertManifestEqual(acceptance.split, 'B_dev', 'acceptance.split')
+  assertManifestEqual(acceptance.metric, 'equal_category_accuracy', 'acceptance.metric')
+  assertManifestEqual(acceptance.direction, 'maximize', 'acceptance.direction')
+  assertManifestEqual(acceptance.baseline_score, H0_BASELINE_SCORE, 'acceptance.baseline_score')
+  return manifest
+}
+
+export function persistStage4CRunManifest(manifest, path = STAGE4C_GETELUCID_MANIFEST_FILE) {
+  const normalizedPath = resolve(path)
+  if (normalizedPath !== path) throw new Error('Stage 4C run manifest path must be absolute and normalized')
+  const parent = dirname(normalizedPath)
+  mkdirSync(parent, { recursive: true, mode: 0o700 })
+  requireRealDirectory(parent, 'Stage 4C run manifest parent')
+  const content = `${canonicalJson(manifest)}\n`
+  if (existsSync(normalizedPath)) {
+    assertRegularFile(normalizedPath, 'Stage 4C run manifest')
+    if (readFileSync(normalizedPath, 'utf8') !== content) {
+      throw new Error('existing Stage 4C run manifest conflicts with the frozen plan')
+    }
+    return Object.freeze({ manifest: deepFreeze(manifest), path: normalizedPath, sha256: sha256(content) })
+  }
+
+  manifestTemporarySequence += 1
+  const temporary = resolve(parent, `.run-manifest.${String(process.pid)}.${String(manifestTemporarySequence)}.tmp`)
+  let descriptor
+  try {
+    descriptor = openSync(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0), 0o600)
+    writeFileSync(descriptor, content, 'utf8')
+    fsyncSync(descriptor)
+    closeSync(descriptor)
+    descriptor = undefined
+    try {
+      linkSync(temporary, normalizedPath)
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error
+      assertRegularFile(normalizedPath, 'Stage 4C run manifest')
+      if (readFileSync(normalizedPath, 'utf8') !== content) {
+        throw new Error('existing Stage 4C run manifest conflicts with the frozen plan')
+      }
+    }
+    const parentDescriptor = openSync(parent, constants.O_RDONLY)
+    try { fsyncSync(parentDescriptor) } finally { closeSync(parentDescriptor) }
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor)
+    try { unlinkSync(temporary) } catch (error) {
+      if (error?.code !== 'ENOENT') throw error
+    }
+  }
+  return Object.freeze({ manifest: deepFreeze(manifest), path: normalizedPath, sha256: sha256(content) })
+}
+
+export function readStage4CRunManifest(execution, path = STAGE4C_GETELUCID_MANIFEST_FILE) {
+  const normalizedPath = resolve(path)
+  if (normalizedPath !== path) throw new Error('Stage 4C run manifest path must be absolute and normalized')
+  if (!existsSync(normalizedPath)) return undefined
+  assertRegularFile(normalizedPath, 'Stage 4C run manifest')
+  const content = readFileSync(normalizedPath, 'utf8')
+  let manifest
+  try {
+    manifest = JSON.parse(content)
+  } catch (error) {
+    throw new Error('cannot parse Stage 4C run manifest', { cause: error })
+  }
+  assertStage4CRunManifest(manifest, execution)
+  const canonical = `${canonicalJson(manifest)}\n`
+  if (content !== canonical) throw new Error('Stage 4C run manifest is not in canonical form')
+  return Object.freeze({ manifest: deepFreeze(manifest), path: normalizedPath, sha256: sha256(content) })
+}
+
+export function createManifestingProposer(delegate, execution, manifestPath = STAGE4C_GETELUCID_MANIFEST_FILE) {
+  if (delegate === null || typeof delegate !== 'object' || typeof delegate.create !== 'function') {
+    throw new Error('Stage 4C manifesting proposer requires a proposal delegate')
+  }
+  return Object.freeze({
+    create: async (profileId, runId, signal) => {
+      const session = await delegate.create(profileId, runId, signal)
+      return Object.freeze({
+        agent: session.agent,
+        propose: async (request, proposalSignal) => {
+          if (request.max_attempts !== MAX_PROPOSAL_DRAFTS || request.attempt !== 1) {
+            throw new Error('Stage 4C proposal request exceeds the frozen one-request budget')
+          }
+          const manifest = createStage4CRunManifest(execution, request.context)
+          persistStage4CRunManifest(manifest, manifestPath)
+          return session.propose(request, proposalSignal)
+        },
+        cancel: reason => session.cancel(reason),
+        dispose: () => session.dispose(),
+      })
+    },
   })
 }
 
@@ -558,13 +789,72 @@ function assertContained(root, path, label) {
   }
 }
 
+function sha256(value) {
+  return createHash('sha256').update(value).digest('hex')
+}
+
+function canonicalJson(value) {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value)
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new Error('Stage 4C manifest input contains a non-finite number')
+    return JSON.stringify(value)
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  if (typeof value !== 'object' || value === null || Object.getPrototypeOf(value) !== Object.prototype) {
+    throw new Error('Stage 4C manifest input must contain only plain JSON values')
+  }
+  const entries = Object.entries(value).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+  if (entries.some(([, entry]) => entry === undefined)) {
+    throw new Error('Stage 4C manifest input contains undefined')
+  }
+  return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`).join(',')}}`
+}
+
+function deepFreeze(value) {
+  if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
+    for (const child of Object.values(value)) deepFreeze(child)
+    Object.freeze(value)
+  }
+  return value
+}
+
+function requireExactRecord(value, fields, label) {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error(`${label} must be an object`)
+  }
+  const actual = Object.keys(value).sort()
+  const expected = [...fields].sort()
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error(`${label} must contain exactly: ${expected.join(', ')}`)
+  }
+  return value
+}
+
+function assertManifestEqual(actual, expected, label) {
+  if (actual !== expected) throw new Error(`Stage 4C run manifest ${label} must be ${String(expected)}`)
+}
+
+function requireRealDirectory(path, label) {
+  const inspected = lstatSync(path)
+  if (inspected.isSymbolicLink() || !inspected.isDirectory() || realpathSync(path) !== path) {
+    throw new Error(`${label} must be one real directory`)
+  }
+}
+
+function assertRegularFile(path, label) {
+  const inspected = lstatSync(path)
+  if (inspected.isSymbolicLink() || !inspected.isFile() || realpathSync(path) !== path) {
+    throw new Error(`${label} must be one real regular file`)
+  }
+}
+
 function isErrorCode(error, code) {
   return typeof error === 'object' && error !== null && error.code === code
 }
 
 function secrets() {
   return [
-    process.env[PJLAB_API_KEY_ENV],
+    process.env[GETELUCID_API_KEY_ENV],
     process.env.HTTPS_PROXY,
     process.env.https_proxy,
     process.env.HTTP_PROXY,

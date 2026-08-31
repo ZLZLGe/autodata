@@ -324,7 +324,7 @@ describe('candidate process validator', () => {
   })
 
   it('passes only ordinary runtime environment to the validation process', async () => {
-    const credentialNames = ['FREEROUTER_API_KEY', 'GITHUB_TOKEN', 'AWS_SECRET_ACCESS_KEY'] as const
+    const credentialNames = ['GETELUCID_API_KEY', 'GITHUB_TOKEN', 'AWS_SECRET_ACCESS_KEY'] as const
     const previous = new Map(credentialNames.map(name => [name, process.env[name]]))
     for (const name of credentialNames) process.env[name] = `validator-test-${name.toLowerCase()}`
     const credentialProbe = new ProcessCandidateValidator({
@@ -333,7 +333,7 @@ describe('candidate process validator', () => {
         let text = ''
         for await (const chunk of process.stdin) text += String(chunk)
         const input = JSON.parse(text)
-        const credentials = ['FREEROUTER_API_KEY', 'GITHUB_TOKEN', 'AWS_SECRET_ACCESS_KEY']
+        const credentials = ['GETELUCID_API_KEY', 'GITHUB_TOKEN', 'AWS_SECRET_ACCESS_KEY']
         if (credentials.some(name => process.env[name] !== undefined)) process.exit(9)
         writeSync(3, JSON.stringify({
           schema_version: 'autodata-candidate-validation-1',

@@ -10,9 +10,9 @@ import {
 afterEach(() => vi.unstubAllEnvs())
 
 describe('generation proposal Agent diagnostics', () => {
-  it('pins the formal Stage 4C proposer to the approved PJLAB route', () => {
-    expect(GENERATION_PROVIDER).toBe('pjlab')
-    expect(GENERATION_MODEL).toBe('glm-5.3-flash')
+  it('pins the formal Stage 4C proposer to the approved GetElucid route', () => {
+    expect(GENERATION_PROVIDER).toBe('getelucid')
+    expect(GENERATION_MODEL).toBe('gpt-5.6-sol')
   })
 
   it('preserves the bounded provider code and message needed for infrastructure diagnosis', () => {
@@ -71,7 +71,7 @@ describe('generation proposal Agent diagnostics', () => {
   })
 
   it('redacts trimmed API keys and decoded proxy credentials derived from the environment', () => {
-    vi.stubEnv('PJLAB_API_KEY', '  opaque-trimmed-provider-secret  ')
+    vi.stubEnv('GETELUCID_API_KEY', '  opaque-trimmed-provider-secret  ')
     vi.stubEnv('HTTPS_PROXY', 'http://proxy-user:proxy%2Dpassword@example.invalid:8080')
     const result = formatProposalTurnEndFailure({
       kind: 'error',

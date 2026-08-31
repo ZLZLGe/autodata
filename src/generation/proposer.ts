@@ -10,8 +10,8 @@ import {
   type GenerationProposer,
 } from './types.js'
 
-export const GENERATION_PROVIDER = 'pjlab'
-export const GENERATION_MODEL = 'glm-5.3-flash'
+export const GENERATION_PROVIDER = 'getelucid'
+export const GENERATION_MODEL = 'gpt-5.6-sol'
 const DEFAULT_MAX_TOKENS = 16_384
 const MAX_PROVIDER_DIAGNOSTIC_CHARS = 1_000
 

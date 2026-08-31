@@ -20,6 +20,7 @@ interface IdentityModule {
     readonly generationRunRoot: string
     readonly profileId: string
     readonly commit: string
+    readonly maxProposalDrafts: number
     readonly now?: Date
   }): ExecutionIdentity
 }
@@ -52,6 +53,7 @@ function writeClaim(generationRunRoot: string, overrides: Record<string, unknown
     experiment_run_id: 'h1-0123456789ab-20260830',
     candidate_id: 'candidate-h1-0123456789ab-20260830',
     execution_commit: commit,
+    max_proposal_drafts: 1,
     ...overrides,
   })}\n`)
   return path
@@ -64,12 +66,14 @@ describe('Stage 4C formal execution identity', () => {
       generationRunRoot,
       profileId,
       commit,
+      maxProposalDrafts: 1,
       now: new Date('2026-08-30T15:59:59.000Z'),
     })
     const afterMidnight = identityModule.resolveStage4CExecutionIdentity({
       generationRunRoot,
       profileId,
       commit,
+      maxProposalDrafts: 1,
       now: new Date('2026-08-30T16:00:00.000Z'),
     })
     expect(beforeMidnight.run_date).toBe('20260830')
@@ -83,6 +87,7 @@ describe('Stage 4C formal execution identity', () => {
       generationRunRoot,
       profileId,
       commit,
+      maxProposalDrafts: 1,
       now: new Date('2026-09-12T00:00:00.000Z'),
     })
     expect(resolved).toMatchObject({
@@ -97,13 +102,19 @@ describe('Stage 4C formal execution identity', () => {
     ['extra field', { extra: true }],
     ['wrong schema', { schema_version: 'wrong' }],
     ['wrong commit', { execution_commit: 'f'.repeat(40) }],
+    ['wrong proposal budget', { max_proposal_drafts: 2 }],
     ['mismatched experiment ID', { experiment_run_id: 'h1-0123456789ab-20260831' }],
     ['mismatched candidate ID', { candidate_id: 'candidate-h1-0123456789ab-20260831' }],
     ['invalid calendar date', { run_id: 'first-h1-0123456789ab-20260230' }],
   ])('fails closed for a claim with %s', async (_label, overrides) => {
     const generationRunRoot = await root()
     writeClaim(generationRunRoot, overrides)
-    expect(() => identityModule.resolveStage4CExecutionIdentity({ generationRunRoot, profileId, commit }))
+    expect(() => identityModule.resolveStage4CExecutionIdentity({
+      generationRunRoot,
+      profileId,
+      commit,
+      maxProposalDrafts: 1,
+    }))
       .toThrow()
   })
 
@@ -115,6 +126,7 @@ describe('Stage 4C formal execution identity', () => {
       generationRunRoot: malformedRoot,
       profileId,
       commit,
+      maxProposalDrafts: 1,
     })).toThrow(/cannot parse/iu)
 
     const symlinkRoot = await root()
@@ -127,6 +139,7 @@ describe('Stage 4C formal execution identity', () => {
       generationRunRoot: linkRoot,
       profileId,
       commit,
+      maxProposalDrafts: 1,
     })).toThrow(/symbolic link/iu)
   })
 })
