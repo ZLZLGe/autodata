@@ -16,11 +16,17 @@ import {
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path'
 import { canonicalJson, parseStrictJsonObject } from '../core/json.js'
 import { validateExperimentId } from '../experiment/contracts.js'
-import { GenerationError, type GenerationState } from './types.js'
-import { normalizeGenerationState } from './state.js'
+import {
+  GENERATION_STATE_VERSION,
+  LEGACY_GENERATION_STATE_VERSION,
+  GenerationError,
+  type GenerationState,
+} from './types.js'
+import { normalizeGenerationStartRequest, normalizeGenerationState } from './state.js'
 
 export const DEFAULT_GENERATION_RUN_ROOT = '/data/codex-work/autodata/runs/generations'
-const FIRST_H1_CLAIM_VERSION = 'autodata-first-h1-claim-1'
+const LEGACY_FIRST_H1_CLAIM_VERSION = 'autodata-first-h1-claim-1'
+const FIRST_H1_CLAIM_VERSION = 'autodata-first-h1-claim-2'
 const FIRST_H1_CLAIM_FILE = 'first-h1-claim.json'
 let temporarySequence = 0
 
@@ -96,13 +102,16 @@ export class GenerationLedger {
    * Permanently reserve the one Stage 4C generation allowed for a profile.
    *
    * The claim deliberately survives pre-candidate failures: otherwise a new
-   * commit/run ID could reset the three-draft budget and silently turn the
+   * commit/run ID could reset the per-run draft budget and silently turn the
    * pre-registered first-H1 experiment into candidate shopping. Replaying the
    * exact same identity is allowed so a crash between claim and run-directory
    * publication can finish initialization.
    */
   claimFirstH1(stateInput: GenerationState): void {
     const state = normalizeGenerationState(stateInput)
+    if (state.schema_version !== GENERATION_STATE_VERSION) {
+      throw new GenerationError('cannot create a first-H1 claim from a legacy generation state', 'STATE_CORRUPT')
+    }
     ensureDirectory(this.root)
     const profile = dirname(this.runDirectory(state.profile_id, state.run_id))
     ensureDirectory(profile)
@@ -132,6 +141,9 @@ export class GenerationLedger {
 
   initialize(stateInput: GenerationState, artifacts: Readonly<Record<string, string>>): GenerationState {
     const state = normalizeGenerationState(stateInput)
+    if (state.schema_version !== GENERATION_STATE_VERSION) {
+      throw new GenerationError('cannot initialize a legacy generation state', 'STATE_CORRUPT')
+    }
     const run = this.runDirectory(state.profile_id, state.run_id)
     if (state.run_directory !== run || state.phase !== 'initialized') {
       throw new GenerationError('initial generation state does not match its ledger path', 'STATE_CORRUPT')
@@ -170,8 +182,13 @@ export class GenerationLedger {
 
   saveState(stateInput: GenerationState): GenerationState {
     const state = normalizeGenerationState(stateInput)
+    if (state.schema_version !== GENERATION_STATE_VERSION) {
+      throw new GenerationError('legacy generation state is read-only', 'STATE_CORRUPT')
+    }
     const run = this.requireRun(state.profile_id, state.run_id)
     if (state.run_directory !== run) throw new GenerationError('generation state path does not match configured root', 'PATH_ESCAPE')
+    this.requireFirstH1Claim(state)
+    this.requireGenerationRequest(state)
     const target = resolve(run, 'state.json')
     assertNoSymlink(this.root, target)
     temporarySequence += 1
@@ -204,6 +221,7 @@ export class GenerationLedger {
       throw new GenerationError('generation state identity does not match its ledger path', 'STATE_CORRUPT')
     }
     this.requireFirstH1Claim(state)
+    this.requireGenerationRequest(state)
     return state
   }
 
@@ -259,14 +277,21 @@ export class GenerationLedger {
     }
   }
 
-  private firstH1Claim(state: GenerationState): Readonly<Record<string, string>> {
-    return Object.freeze({
-      schema_version: FIRST_H1_CLAIM_VERSION,
+  private firstH1Claim(state: GenerationState): Readonly<Record<string, unknown>> {
+    const common = {
       profile_id: state.profile_id,
       run_id: state.run_id,
       experiment_run_id: state.experiment_run_id,
       candidate_id: state.candidate_id,
       execution_commit: state.execution_commit,
+    }
+    if (state.schema_version === LEGACY_GENERATION_STATE_VERSION) {
+      return Object.freeze({ schema_version: LEGACY_FIRST_H1_CLAIM_VERSION, ...common })
+    }
+    return Object.freeze({
+      schema_version: FIRST_H1_CLAIM_VERSION,
+      ...common,
+      max_proposal_drafts: state.max_proposal_drafts,
     })
   }
 
@@ -286,6 +311,44 @@ export class GenerationLedger {
     }
     if (canonicalJson(existing) !== canonicalJson(this.firstH1Claim(state))) {
       throw new GenerationError('generation state conflicts with its durable first-H1 claim', 'STATE_CORRUPT', {
+        profile_id: state.profile_id,
+        run_id: state.run_id,
+      })
+    }
+  }
+
+  private requireGenerationRequest(state: GenerationState): void {
+    const path = resolve(state.run_directory, 'request.json')
+    assertNoSymlink(this.root, path)
+    let raw: Record<string, unknown>
+    let request
+    try {
+      raw = this.readJson(path, 'generation request')
+      if (state.schema_version === GENERATION_STATE_VERSION && !Object.hasOwn(raw, 'max_proposal_drafts')) {
+        throw new GenerationError('generation v2 request is missing max_proposal_drafts', 'ARTIFACT_INVALID')
+      }
+      request = normalizeGenerationStartRequest(raw)
+    } catch (error) {
+      if (error instanceof GenerationError && error.code === 'ARTIFACT_INVALID') throw error
+      throw new GenerationError('generation request is invalid', 'ARTIFACT_INVALID', {
+        profile_id: state.profile_id,
+        run_id: state.run_id,
+        cause: error,
+      })
+    }
+    const expected = {
+      profile_id: state.profile_id,
+      run_id: state.run_id,
+      experiment_run_id: state.experiment_run_id,
+      execution_commit: state.execution_commit,
+      baseline_run_directory: state.baseline_run_directory,
+      b_search_cases_jsonl: state.b_search_cases_jsonl,
+      candidate_id: state.candidate_id,
+      strategy_version: state.strategy_version,
+      max_proposal_drafts: state.max_proposal_drafts,
+    }
+    if (canonicalJson(request) !== canonicalJson(expected)) {
+      throw new GenerationError('generation request conflicts with its durable state', 'ARTIFACT_INVALID', {
         profile_id: state.profile_id,
         run_id: state.run_id,
       })

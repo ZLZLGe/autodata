@@ -5,10 +5,11 @@ import type { CandidateValidationResult } from '../evolution/validator.js'
 import {
   GENERATION_MAX_DRAFTS,
   GENERATION_STATE_VERSION,
+  LEGACY_GENERATION_STATE_VERSION,
   GenerationError,
   type GenerationDraftAttempt,
   type GenerationErrorCode,
-  type GenerationStartRequest,
+  type NormalizedGenerationStartRequest,
   type GenerationState,
 } from './types.js'
 
@@ -44,13 +45,14 @@ function absolute(value: unknown, label: string): string {
   return resolve(path)
 }
 
-export function normalizeGenerationStartRequest(value: unknown): GenerationStartRequest {
+export function normalizeGenerationStartRequest(value: unknown): NormalizedGenerationStartRequest {
   if (!isJsonObject(value)) throw new GenerationError('generation start request must be an object', 'INVALID_REQUEST')
-  const fields = [
+  const requiredFields = [
     'profile_id', 'run_id', 'experiment_run_id', 'execution_commit', 'baseline_run_directory',
     'b_search_cases_jsonl', 'candidate_id', 'strategy_version',
   ] as const
-  const missing = fields.find(field => !Object.hasOwn(value, field))
+  const fields = [...requiredFields, 'max_proposal_drafts'] as const
+  const missing = requiredFields.find(field => !Object.hasOwn(value, field))
   if (missing !== undefined) throw new GenerationError(`generation start request is missing ${missing}`, 'INVALID_REQUEST')
   const extra = Object.keys(value).find(field => !fields.includes(field as typeof fields[number]))
   if (extra !== undefined) throw new GenerationError(`generation start request has unsupported field ${extra}`, 'INVALID_REQUEST')
@@ -70,6 +72,18 @@ export function normalizeGenerationStartRequest(value: unknown): GenerationStart
   if (typeof cases !== 'string' || !isAbsolute(cases)) {
     throw new GenerationError('b_search_cases_jsonl must be absolute', 'INVALID_REQUEST')
   }
+  const maxProposalDrafts = value.max_proposal_drafts ?? GENERATION_MAX_DRAFTS
+  if (
+    typeof maxProposalDrafts !== 'number'
+    || !Number.isSafeInteger(maxProposalDrafts)
+    || maxProposalDrafts < 1
+    || maxProposalDrafts > GENERATION_MAX_DRAFTS
+  ) {
+    throw new GenerationError(
+      `max_proposal_drafts must be a safe integer between 1 and ${String(GENERATION_MAX_DRAFTS)}`,
+      'INVALID_REQUEST',
+    )
+  }
   return Object.freeze({
     profile_id: validateExperimentId(value.profile_id, 'profile_id'),
     run_id: validateExperimentId(value.run_id, 'run_id'),
@@ -79,11 +93,12 @@ export function normalizeGenerationStartRequest(value: unknown): GenerationStart
     b_search_cases_jsonl: resolve(cases),
     candidate_id: validateExperimentId(value.candidate_id, 'candidate_id'),
     strategy_version: strategyVersion,
+    max_proposal_drafts: maxProposalDrafts,
   })
 }
 
 export function createInitialGenerationState(input: {
-  readonly request: GenerationStartRequest
+  readonly request: NormalizedGenerationStartRequest
   readonly run_directory: string
   readonly now: string
 }): GenerationState {
@@ -102,6 +117,8 @@ export function createInitialGenerationState(input: {
     b_search_cases_jsonl: input.request.b_search_cases_jsonl,
     created_at: input.now,
     updated_at: input.now,
+    max_proposal_drafts: input.request.max_proposal_drafts,
+    proposal_drafts_started: 0,
     attempts: [],
     formal_candidate_persisted: false,
   })
@@ -109,30 +126,58 @@ export function createInitialGenerationState(input: {
 
 export function normalizeGenerationState(value: unknown): GenerationState {
   if (!isJsonObject(value)) corrupt('generation state must be an object')
-  const required = [
+  const commonRequired = [
     'schema_version', 'profile_id', 'run_id', 'experiment_run_id', 'candidate_id',
     'strategy_version', 'execution_commit', 'status', 'phase', 'run_directory', 'baseline_run_directory',
     'b_search_cases_jsonl', 'created_at', 'updated_at', 'attempts',
     'formal_candidate_persisted',
   ] as const
+  const legacy = value.schema_version === LEGACY_GENERATION_STATE_VERSION
+  if (!legacy && value.schema_version !== GENERATION_STATE_VERSION) {
+    corrupt('generation state schema_version is unsupported')
+  }
+  const required = legacy
+    ? commonRequired
+    : [...commonRequired, 'max_proposal_drafts', 'proposal_drafts_started'] as const
   const optional = new Set([
     'candidate_source_path', 'candidate_source_sha256', 'materialized_data_path',
     'materialization_sha256', 'experiment_started', 'decision', 'feedback_id', 'failure',
   ])
   const missing = required.find(field => !Object.hasOwn(value, field))
   if (missing !== undefined) corrupt(`generation state is missing ${missing}`)
-  const extra = Object.keys(value).find(field => !required.includes(field as typeof required[number]) && !optional.has(field))
+  const requiredSet = new Set<string>(required)
+  const extra = Object.keys(value).find(field => !requiredSet.has(field) && !optional.has(field))
   if (extra !== undefined) corrupt(`generation state has unsupported field ${extra}`)
-  if (value.schema_version !== GENERATION_STATE_VERSION) corrupt('generation state schema_version is unsupported')
   const profileId = validateExperimentId(value.profile_id, 'profile_id')
   const runId = validateExperimentId(value.run_id, 'run_id')
   if (!STATUSES.has(value.status as string)) corrupt('generation state.status is invalid')
   if (!PHASES.has(value.phase as string)) corrupt('generation state.phase is invalid')
-  if (!Array.isArray(value.attempts) || value.attempts.length > GENERATION_MAX_DRAFTS) {
-    corrupt(`generation state attempts must contain at most ${String(GENERATION_MAX_DRAFTS)} entries`)
+  const maxProposalDrafts = legacy ? GENERATION_MAX_DRAFTS : value.max_proposal_drafts
+  if (
+    typeof maxProposalDrafts !== 'number'
+    || !Number.isSafeInteger(maxProposalDrafts)
+    || maxProposalDrafts < 1
+    || maxProposalDrafts > GENERATION_MAX_DRAFTS
+  ) {
+    corrupt(`generation state max_proposal_drafts must be between 1 and ${String(GENERATION_MAX_DRAFTS)}`)
+  }
+  if (!Array.isArray(value.attempts) || value.attempts.length > maxProposalDrafts) {
+    corrupt(`generation state attempts must contain at most ${String(maxProposalDrafts)} entries`)
   }
   const attempts = value.attempts.map((attempt, index) => normalizeAttempt(attempt, index + 1))
+  const proposalDraftsStarted = legacy ? attempts.length : value.proposal_drafts_started
+  if (
+    typeof proposalDraftsStarted !== 'number'
+    || !Number.isSafeInteger(proposalDraftsStarted)
+    || proposalDraftsStarted < attempts.length
+    || proposalDraftsStarted > maxProposalDrafts
+    || proposalDraftsStarted - attempts.length > 1
+  ) corrupt('generation state proposal_drafts_started is inconsistent with its draft budget')
   if (typeof value.formal_candidate_persisted !== 'boolean') corrupt('formal_candidate_persisted must be boolean')
+  if (
+    proposalDraftsStarted !== attempts.length
+    && (value.phase !== 'proposing' || value.formal_candidate_persisted)
+  ) corrupt('only an unpersisted proposing state may contain a pending proposal draft')
   const candidateSourceSha = optionalSha(value.candidate_source_sha256, 'candidate_source_sha256')
   const materializationSha = optionalSha(value.materialization_sha256, 'materialization_sha256')
   const decision = value.decision === undefined ? undefined : (() => {
@@ -168,7 +213,7 @@ export function normalizeGenerationState(value: unknown): GenerationState {
     }
   })()
   const state: GenerationState = {
-    schema_version: GENERATION_STATE_VERSION,
+    schema_version: legacy ? LEGACY_GENERATION_STATE_VERSION : GENERATION_STATE_VERSION,
     profile_id: profileId,
     run_id: runId,
     experiment_run_id: validateExperimentId(value.experiment_run_id, 'experiment_run_id'),
@@ -186,6 +231,8 @@ export function normalizeGenerationState(value: unknown): GenerationState {
     b_search_cases_jsonl: absolute(value.b_search_cases_jsonl, 'b_search_cases_jsonl'),
     created_at: timestamp(value.created_at, 'created_at'),
     updated_at: timestamp(value.updated_at, 'updated_at'),
+    max_proposal_drafts: maxProposalDrafts,
+    proposal_drafts_started: proposalDraftsStarted,
     attempts,
     formal_candidate_persisted: value.formal_candidate_persisted,
     ...(value.candidate_source_path === undefined ? {} : { candidate_source_path: absolute(value.candidate_source_path, 'candidate_source_path') }),

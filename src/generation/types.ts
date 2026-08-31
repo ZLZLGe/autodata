@@ -8,7 +8,8 @@ import type { ExperimentController } from '../experiment/controller.js'
 import type { EvolutionController } from '../evolution/controller.js'
 import type { CandidateValidator } from '../evolution/validator.js'
 
-export const GENERATION_STATE_VERSION = 'autodata-generation-state-1'
+export const LEGACY_GENERATION_STATE_VERSION = 'autodata-generation-state-1'
+export const GENERATION_STATE_VERSION = 'autodata-generation-state-2'
 export const GENERATION_MATERIALIZATION_VERSION = 'autodata-generation-materialization-1'
 export const GENERATION_MAX_DRAFTS = 3
 
@@ -41,6 +42,12 @@ export interface GenerationStartRequest {
   readonly b_search_cases_jsonl: string
   readonly candidate_id: string
   readonly strategy_version: string
+  /** Per-run proposal budget. Omission preserves the historical three-draft behavior. */
+  readonly max_proposal_drafts?: number
+}
+
+export type NormalizedGenerationStartRequest = Omit<GenerationStartRequest, 'max_proposal_drafts'> & {
+  readonly max_proposal_drafts: number
 }
 
 export interface GenerationFailureContext {
@@ -156,7 +163,7 @@ export interface GenerationDecision {
 }
 
 export interface GenerationState {
-  readonly schema_version: typeof GENERATION_STATE_VERSION
+  readonly schema_version: typeof LEGACY_GENERATION_STATE_VERSION | typeof GENERATION_STATE_VERSION
   readonly profile_id: string
   readonly run_id: string
   readonly experiment_run_id: string
@@ -170,6 +177,10 @@ export interface GenerationState {
   readonly b_search_cases_jsonl: string
   readonly created_at: string
   readonly updated_at: string
+  /** Immutable per-run proposal budget. Legacy v1 states are projected as three. */
+  readonly max_proposal_drafts: number
+  /** Number of proposal slots durably reserved before entering the model boundary. */
+  readonly proposal_drafts_started: number
   readonly attempts: readonly GenerationDraftAttempt[]
   readonly formal_candidate_persisted: boolean
   readonly candidate_source_path?: string

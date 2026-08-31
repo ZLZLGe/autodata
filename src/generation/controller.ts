@@ -38,7 +38,7 @@ import { DshGenerationProposer } from './proposer.js'
 import { normalizeGenerationBSearchResults, type GenerationBSearchResults } from './protocol.js'
 import { createInitialGenerationState, normalizeGenerationStartRequest } from './state.js'
 import {
-  GENERATION_MAX_DRAFTS,
+  LEGACY_GENERATION_STATE_VERSION,
   GenerationError,
   type GenerationControllerOptions,
   type GenerationDecision,
@@ -65,6 +65,7 @@ const EXPERIMENT_CONTRACT_FILE = 'experiment-contract.json'
 const FEEDBACK_FILE = 'feedback.json'
 const MAX_DRAFT_FAILURE_CHARACTERS = 8192
 const MAX_MODEL_REPAIR_FEEDBACK_CHARACTERS = 1000
+const INDETERMINATE_PROPOSAL_FAILURE = 'proposal draft outcome is indeterminate after an interruption; the durably reserved slot was consumed without replay'
 
 interface LiveGeneration {
   readonly abort: AbortController
@@ -164,6 +165,7 @@ export class GenerationController {
   status(profileId: string, runId: string): GenerationStatus {
     this.assertUsable()
     const state = this.ledger.loadState(profileId, runId)
+    this.assertProposalArtifactBounds(state)
     if (state.status === 'succeeded' && state.phase === 'complete') this.assertCompletedEvidence(state)
     const jobId = this.processJobs.get(runKey(state.profile_id, state.run_id))
     return Object.freeze({ state, ...(jobId === undefined ? {} : { job_id: jobId }) })
@@ -177,6 +179,14 @@ export class GenerationController {
       throw new GenerationError(`TaskProfile ${profileId} already has a live generation`, 'RUN_EXISTS')
     }
     const state = this.ledger.loadState(profileId, runId)
+    this.assertProposalArtifactBounds(state)
+    if (state.schema_version === LEGACY_GENERATION_STATE_VERSION) {
+      if (state.status === 'succeeded' && state.phase === 'complete') this.assertCompletedEvidence(state)
+      if (state.status === 'succeeded' || state.status === 'failed' || state.status === 'cancelled') {
+        return Object.freeze({ state })
+      }
+      throw new GenerationError('legacy generation state is read-only and cannot be resumed', 'STATE_CORRUPT')
+    }
     if (state.status === 'failed' || state.status === 'cancelled') return Object.freeze({ state })
     if (state.status === 'succeeded' && state.phase === 'complete') this.assertCompletedEvidence(state)
     return this.launch(state, true)
@@ -269,6 +279,7 @@ export class GenerationController {
     live: LiveGeneration,
   ): Promise<import('@deepseek-ai/dsh-jobs').JobOutcome> {
     let state = this.ledger.loadState(profileId, runId)
+    this.assertProposalArtifactBounds(state)
     let session: GenerationProposalSession | undefined
     const completedReplay = state.status === 'succeeded' && state.phase === 'complete'
     try {
@@ -370,17 +381,25 @@ export class GenerationController {
     state = await this.reconcileOrphanDrafts(state, frozen, live)
     if (state.phase === 'candidate_ready') return state
     let previousFailure = modelRepairFeedback(state.attempts.at(-1)?.failure)
-    for (let attempt = state.attempts.length + 1; attempt <= GENERATION_MAX_DRAFTS; attempt += 1) {
+    for (
+      let attempt = state.proposal_drafts_started + 1;
+      attempt <= state.max_proposal_drafts;
+      attempt += 1
+    ) {
       if (live.abort.signal.aborted) throw new GenerationError('candidate proposal was cancelled', 'CANCEL_FAILED')
       const directory = resolve(state.run_directory, 'attempts', `draft-${String(attempt).padStart(2, '0')}`)
       const responsePath = resolve(directory, 'response.json')
       const createdAt = nowIso(this.now)
       let draft: GenerationDraft | undefined
       let validation: Awaited<ReturnType<CandidateValidator['validate']>> | undefined
+      // The durable reservation is the at-most-once boundary. Once it is
+      // published, this slot is consumed even if the process dies before a
+      // response can be recorded.
+      state = this.save(state, { proposal_drafts_started: attempt })
       try {
         draft = await session.propose({
           attempt,
-          max_attempts: GENERATION_MAX_DRAFTS,
+          max_attempts: state.max_proposal_drafts,
           context: frozen.proposalContext,
           ...(previousFailure === undefined ? {} : { previous_failure: previousFailure }),
         }, live.abort.signal)
@@ -452,7 +471,7 @@ export class GenerationController {
         this.note(live, `ephemeral draft ${String(attempt)} failed: ${failure}`)
       }
     }
-    throw new GenerationError(`all ${String(GENERATION_MAX_DRAFTS)} ephemeral drafts failed`, 'PROPOSAL_FAILED')
+    throw new GenerationError(`all ${String(state.max_proposal_drafts)} ephemeral drafts failed`, 'PROPOSAL_FAILED')
   }
 
   private async reconcileOrphanDrafts(
@@ -461,12 +480,35 @@ export class GenerationController {
     live: LiveGeneration,
   ): Promise<GenerationState> {
     let state = initial
-    while (state.attempts.length < GENERATION_MAX_DRAFTS) {
+    while (state.attempts.length < state.proposal_drafts_started) {
       const attempt = state.attempts.length + 1
       const directory = resolve(state.run_directory, 'attempts', `draft-${String(attempt).padStart(2, '0')}`)
       const responsePath = resolve(directory, 'response.json')
-      if (!existsSync(responsePath)) return state
       const createdAt = nowIso(this.now)
+      if (!existsSync(responsePath)) {
+        if (existsSync(directory)) {
+          let entries
+          try { entries = readdirSync(directory, { withFileTypes: true }) } catch (error) {
+            throw new GenerationError('cannot inspect pending proposal draft directory', 'ARTIFACT_INVALID', { cause: error })
+          }
+          if (entries.length > 0) {
+            throw new GenerationError('pending proposal draft without a response contains unexpected artifacts', 'ARTIFACT_INVALID')
+          }
+        }
+        this.ledger.writeNewOrSameJson(responsePath, { error: INDETERMINATE_PROPOSAL_FAILURE }, state.run_directory)
+        state = this.save(state, {
+          phase: 'proposing',
+          attempts: [...state.attempts, {
+            attempt,
+            status: 'failed',
+            response_path: responsePath,
+            created_at: createdAt,
+            failure: INDETERMINATE_PROPOSAL_FAILURE,
+          }],
+        })
+        this.note(live, `consumed indeterminate ephemeral draft ${String(attempt)} without replay`)
+        continue
+      }
       const response = this.ledger.readJson(
         this.requireContainedFile(state.run_directory, responsePath, 'orphan draft response'),
         'orphan draft response',
@@ -823,6 +865,7 @@ export class GenerationController {
         b_search_cases_jsonl: state.b_search_cases_jsonl,
         candidate_id: state.candidate_id,
         strategy_version: state.strategy_version,
+        max_proposal_drafts: state.max_proposal_drafts,
       })) throw new GenerationError('completed generation request no longer matches its state', 'ARTIFACT_INVALID')
 
       const frozen = this.loadFrozenInputs(state, true)
@@ -1718,6 +1761,36 @@ export class GenerationController {
     ) throw new GenerationError('Stage 4C start requires completed H0 with no open candidate', 'INVALID_REQUEST')
     if (this.options.evolution.feedback(request.profile_id)?.candidate_id !== H0_CANDIDATE_ID) {
       throw new GenerationError('Stage 4C start requires current H0 B_search feedback', 'INVALID_REQUEST')
+    }
+  }
+
+  private assertProposalArtifactBounds(state: GenerationState): void {
+    const attemptsDirectory = resolve(state.run_directory, 'attempts')
+    if (!existsSync(attemptsDirectory)) return
+    let root
+    let entries
+    try {
+      root = lstatSync(attemptsDirectory)
+      entries = readdirSync(attemptsDirectory, { withFileTypes: true })
+    } catch (error) {
+      throw new GenerationError('cannot inspect generation proposal artifacts', 'ARTIFACT_INVALID', { cause: error })
+    }
+    if (root.isSymbolicLink() || !root.isDirectory()) {
+      throw new GenerationError('generation attempts path must be a real directory', 'PATH_ESCAPE')
+    }
+    for (const entry of entries) {
+      const match = /^draft-(\d{2})$/u.exec(entry.name)
+      if (match === null || entry.isSymbolicLink() || !entry.isDirectory()) {
+        throw new GenerationError('generation attempts contain a non-canonical draft artifact', 'ARTIFACT_INVALID')
+      }
+      const attempt = Number(match[1])
+      if (
+        attempt < 1
+        || attempt > state.max_proposal_drafts
+        || attempt > state.proposal_drafts_started
+      ) {
+        throw new GenerationError('generation attempts contain an unreserved or over-budget draft', 'ARTIFACT_INVALID')
+      }
     }
   }
 

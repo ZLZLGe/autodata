@@ -692,6 +692,7 @@ interface FixtureOptions {
   readonly experimentTerminalFailure?: boolean
   readonly materializationCorruption?: 'harness' | 'seed' | 'source' | 'provenance' | 'rank' | 'oversized-plan'
   readonly expectedProposalContextSha256?: string
+  readonly maxProposalDrafts?: number
 }
 
 function fixture(options: FixtureOptions = {}) {
@@ -756,6 +757,7 @@ function fixture(options: FixtureOptions = {}) {
     b_search_cases_jsonl: baseline.searchCases,
     candidate_id: CANDIDATE_ID,
     strategy_version: STRATEGY_VERSION,
+    ...(options.maxProposalDrafts === undefined ? {} : { max_proposal_drafts: options.maxProposalDrafts }),
   }
   return { root, validator, runtime, store, evolution, proposer, materializer, experiment, jobs, generation, request }
 }
@@ -843,9 +845,80 @@ describe('GenerationController fake end-to-end workflow', () => {
     expect(value.proposer.requests[1]?.previous_failure).toMatch(/fixture rejected/iu)
     expect(state.attempts).toHaveLength(3)
     expect(state.attempts.every(attempt => attempt.status === 'failed')).toBe(true)
-    expect(state).toMatchObject({ status: 'failed', phase: 'proposing', formal_candidate_persisted: false })
+    expect(state).toMatchObject({
+      schema_version: 'autodata-generation-state-2',
+      status: 'failed',
+      phase: 'proposing',
+      max_proposal_drafts: 3,
+      proposal_drafts_started: 3,
+      formal_candidate_persisted: false,
+    })
     expect(value.evolution.status(PROFILE_ID).state).toMatchObject({ open_candidate_id: null, generation: 0 })
     expect(value.experiment.starts).toHaveLength(0)
+  })
+
+  it('binds a one-draft run to one proposal and persists the resolved budget everywhere', async () => {
+    const value = fixture({ maxProposalDrafts: 1 })
+
+    await expect(startAndWait(value)).resolves.toMatchObject({ status: 'completed' })
+
+    const state = value.generation.status(PROFILE_ID, value.request.run_id).state
+    expect(value.proposer.requests).toHaveLength(1)
+    expect(value.proposer.requests[0]).toMatchObject({ attempt: 1, max_attempts: 1 })
+    expect(state).toMatchObject({ max_proposal_drafts: 1, proposal_drafts_started: 1 })
+    expect(JSON.parse(readFileSync(resolve(state.run_directory, 'request.json'), 'utf8'))).toMatchObject({
+      max_proposal_drafts: 1,
+    })
+    expect(JSON.parse(readFileSync(resolve(
+      value.root,
+      'generations',
+      PROFILE_ID,
+      'first-h1-claim.json',
+    ), 'utf8'))).toMatchObject({
+      schema_version: 'autodata-first-h1-claim-2',
+      max_proposal_drafts: 1,
+    })
+  })
+
+  it('stops after one rejected draft without persisting or experimenting on H1', async () => {
+    const value = fixture({ maxProposalDrafts: 1, validatorOk: false })
+
+    await expect(startAndWait(value)).resolves.toMatchObject({ status: 'failed', detail: 'PROPOSAL_FAILED' })
+
+    const state = value.generation.status(PROFILE_ID, value.request.run_id).state
+    expect(value.proposer.requests.map(request => [request.attempt, request.max_attempts])).toEqual([[1, 1]])
+    expect(state).toMatchObject({
+      status: 'failed',
+      max_proposal_drafts: 1,
+      proposal_drafts_started: 1,
+      attempts: [{ attempt: 1, status: 'failed' }],
+      formal_candidate_persisted: false,
+    })
+    expect(value.evolution.status(PROFILE_ID).state.open_candidate_id).toBeNull()
+    expect(value.experiment.starts).toHaveLength(0)
+  })
+
+  it.each([0, -1, 1.5, 4, Number.NaN])(
+    'rejects invalid max_proposal_drafts %s before claim or model creation',
+    (maxProposalDrafts) => {
+      const value = fixture()
+      const claim = resolve(value.root, 'generations', PROFILE_ID, 'first-h1-claim.json')
+
+      expect(() => value.generation.start({ ...value.request, max_proposal_drafts: maxProposalDrafts }))
+        .toThrowError(expect.objectContaining({ code: 'INVALID_REQUEST' }))
+      expect(existsSync(claim)).toBe(false)
+      expect(value.proposer.sessions).toBe(0)
+      expect(value.proposer.requests).toHaveLength(0)
+    },
+  )
+
+  it('rejects unsupported generation request fields before claiming a run', () => {
+    const value = fixture()
+    expect(() => value.generation.start({
+      ...value.request,
+      max_model_drafts: 1,
+    } as GenerationStartRequest)).toThrowError(expect.objectContaining({ code: 'INVALID_REQUEST' }))
+    expect(value.proposer.sessions).toBe(0)
   })
 
   it('gives the next draft concise actionable feedback while retaining full validation evidence', async () => {
@@ -894,6 +967,22 @@ describe('GenerationController fake end-to-end workflow', () => {
 
     const started = value.generation.start(value.request)
     await expect(value.jobs.done(started.job_id as JobId)).resolves.toMatchObject({ status: 'completed' })
+  })
+
+  it('binds the draft budget into a claim that survives an initialization crash', () => {
+    const value = fixture({ maxProposalDrafts: 1 })
+    const ledger = (value.generation as unknown as {
+      ledger: { initialize(state: GenerationState, artifacts: Readonly<Record<string, string>>): GenerationState }
+    }).ledger
+    vi.spyOn(ledger, 'initialize').mockImplementationOnce(() => {
+      throw new Error('simulated crash after durable claim')
+    })
+
+    expect(() => value.generation.start(value.request)).toThrow(/simulated crash after durable claim/iu)
+    expect(() => value.generation.start({ ...value.request, max_proposal_drafts: 2 })).toThrowError(
+      expect.objectContaining({ code: 'RUN_EXISTS' }),
+    )
+    expect(value.proposer.sessions).toBe(0)
   })
 
   it('refuses legacy generation history that predates the durable first-H1 claim', () => {
@@ -1037,6 +1126,101 @@ describe('GenerationController fake end-to-end workflow', () => {
     expect(value.materializer.requests).toHaveLength(4)
   })
 
+  it('consumes a reserved one-draft slot without replay when no response was published', async () => {
+    const value = fixture({ maxProposalDrafts: 1 })
+    const ledger = (value.generation as unknown as {
+      ledger: { saveState(state: GenerationState): GenerationState }
+    }).ledger
+    const saveState = ledger.saveState.bind(ledger)
+    let interrupted = false
+    const saveSpy = vi.spyOn(ledger, 'saveState').mockImplementation((state) => {
+      const saved = saveState(state)
+      if (
+        !interrupted
+        && state.phase === 'proposing'
+        && state.proposal_drafts_started === 1
+        && state.attempts.length === 0
+      ) {
+        interrupted = true
+        throw new Error('simulated crash after proposal reservation')
+      }
+      return saved
+    })
+
+    await expect(startAndWait(value)).resolves.toMatchObject({ status: 'failed', detail: 'RECOVERY_REQUIRED' })
+    expect(value.proposer.requests).toHaveLength(0)
+    expect(value.generation.status(PROFILE_ID, value.request.run_id).state).toMatchObject({
+      status: 'recovery_required',
+      phase: 'proposing',
+      max_proposal_drafts: 1,
+      proposal_drafts_started: 1,
+      attempts: [],
+    })
+    saveSpy.mockRestore()
+    await value.generation.dispose()
+
+    const restarted = restartGeneration(value)
+    const resumed = restarted.controller.resume(PROFILE_ID, value.request.run_id)
+    await expect(restarted.jobs.done(resumed.job_id as JobId)).resolves.toMatchObject({
+      status: 'failed',
+      detail: 'PROPOSAL_FAILED',
+    })
+    const state = restarted.controller.status(PROFILE_ID, value.request.run_id).state
+    expect(value.proposer.requests).toHaveLength(0)
+    expect(state.attempts).toHaveLength(1)
+    expect(state.attempts[0]).toMatchObject({
+      attempt: 1,
+      status: 'failed',
+      failure: expect.stringMatching(/indeterminate.*consumed without replay/iu),
+    })
+    expect(JSON.parse(readFileSync(state.attempts[0]?.response_path as string, 'utf8'))).toEqual({
+      error: state.attempts[0]?.failure,
+    })
+  })
+
+  it('does not replay a one-draft slot when interruption follows the model call but precedes its response', async () => {
+    const value = fixture({ maxProposalDrafts: 1 })
+    const proposer = value.proposer as ScriptedProposer
+    const originalCreate = proposer.create.bind(proposer)
+    vi.spyOn(proposer, 'create').mockImplementation(async () => {
+      const session = await originalCreate()
+      return {
+        ...session,
+        propose: async (request, signal) => {
+          proposer.requests.push(request)
+          return new Promise<GenerationDraft>((_resolve, reject) => {
+            signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+          })
+        },
+      }
+    })
+
+    const started = value.generation.start(value.request)
+    await vi.waitFor(() => expect(proposer.requests).toHaveLength(1))
+    await value.generation.cancel(PROFILE_ID, value.request.run_id)
+    const interrupted = value.generation.status(PROFILE_ID, value.request.run_id).state
+    expect(interrupted).toMatchObject({
+      status: 'cancelled',
+      proposal_drafts_started: 1,
+      attempts: [],
+    })
+    writeJson(resolve(interrupted.run_directory, 'state.json'), {
+      ...interrupted,
+      status: 'recovery_required',
+    })
+    await value.generation.dispose()
+
+    const restarted = restartGeneration(value)
+    const resumed = restarted.controller.resume(PROFILE_ID, value.request.run_id)
+    await expect(restarted.jobs.done(resumed.job_id as JobId)).resolves.toMatchObject({
+      status: 'failed',
+      detail: 'PROPOSAL_FAILED',
+    })
+    expect(proposer.requests).toHaveLength(1)
+    expect(restarted.controller.status(PROFILE_ID, value.request.run_id).state.attempts[0]?.failure)
+      .toMatch(/indeterminate.*consumed without replay/iu)
+  })
+
   it('recovers an orphan proposal error as one consumed draft', async () => {
     const value = fixture()
     const proposer = value.proposer as ScriptedProposer
@@ -1131,6 +1315,92 @@ describe('GenerationController fake end-to-end workflow', () => {
       failure: { code: 'ARTIFACT_INVALID' },
       attempts: [],
     })
+  })
+
+  it('rejects request budget drift before creating a proposal session on resume', async () => {
+    const value = fixture({ maxProposalDrafts: 1, validatorOk: false })
+    await expect(startAndWait(value)).resolves.toMatchObject({ status: 'failed' })
+    const state = value.generation.status(PROFILE_ID, value.request.run_id).state
+    const requestPath = resolve(state.run_directory, 'request.json')
+    const request = JSON.parse(readFileSync(requestPath, 'utf8')) as Record<string, unknown>
+    writeJson(requestPath, { ...request, max_proposal_drafts: 2 })
+    await value.generation.dispose()
+
+    const sessions = value.proposer.sessions
+    const restarted = restartGeneration(value)
+    expect(() => restarted.controller.resume(PROFILE_ID, value.request.run_id)).toThrowError(
+      expect.objectContaining({ code: 'ARTIFACT_INVALID' }),
+    )
+    expect(value.proposer.sessions).toBe(sessions)
+  })
+
+  it('rejects an unreserved or over-budget draft directory before creating a proposal session', async () => {
+    const value = fixture({ maxProposalDrafts: 1, validatorOk: false })
+    await expect(startAndWait(value)).resolves.toMatchObject({ status: 'failed' })
+    const state = value.generation.status(PROFILE_ID, value.request.run_id).state
+    mkdirSync(resolve(state.run_directory, 'attempts', 'draft-02'), { recursive: true })
+    await value.generation.dispose()
+
+    const sessions = value.proposer.sessions
+    const restarted = restartGeneration(value)
+    expect(() => restarted.controller.resume(PROFILE_ID, value.request.run_id)).toThrowError(
+      expect.objectContaining({ code: 'ARTIFACT_INVALID' }),
+    )
+    expect(value.proposer.sessions).toBe(sessions)
+  })
+
+  it.each([
+    ['started below attempts', 0],
+    ['started above budget', 2],
+  ] as const)('rejects corrupt proposal accounting: %s', async (_label, proposalDraftsStarted) => {
+    const value = fixture({ maxProposalDrafts: 1, validatorOk: false })
+    await expect(startAndWait(value)).resolves.toMatchObject({ status: 'failed' })
+    const state = value.generation.status(PROFILE_ID, value.request.run_id).state
+    writeJson(resolve(state.run_directory, 'state.json'), {
+      ...state,
+      proposal_drafts_started: proposalDraftsStarted,
+    })
+
+    expect(() => value.generation.status(PROFILE_ID, value.request.run_id)).toThrowError(
+      expect.objectContaining({ code: 'STATE_CORRUPT' }),
+    )
+  })
+
+  it('keeps terminal v1 state readable without rewriting it and refuses nonterminal v1 resume', async () => {
+    const terminal = fixture({ maxProposalDrafts: 1, validatorOk: false })
+    await expect(startAndWait(terminal)).resolves.toMatchObject({ status: 'failed' })
+    const terminalState = terminal.generation.status(PROFILE_ID, terminal.request.run_id).state
+    const terminalStatePath = resolve(terminalState.run_directory, 'state.json')
+    const terminalRequestPath = resolve(terminalState.run_directory, 'request.json')
+    const terminalClaimPath = resolve(terminal.root, 'generations', PROFILE_ID, 'first-h1-claim.json')
+    const legacyState = { ...terminalState } as Record<string, unknown>
+    legacyState.schema_version = 'autodata-generation-state-1'
+    delete legacyState.max_proposal_drafts
+    delete legacyState.proposal_drafts_started
+    const legacyRequest = JSON.parse(readFileSync(terminalRequestPath, 'utf8')) as Record<string, unknown>
+    delete legacyRequest.max_proposal_drafts
+    const legacyClaim = JSON.parse(readFileSync(terminalClaimPath, 'utf8')) as Record<string, unknown>
+    legacyClaim.schema_version = 'autodata-first-h1-claim-1'
+    delete legacyClaim.max_proposal_drafts
+    writeJson(terminalStatePath, legacyState)
+    writeJson(terminalRequestPath, legacyRequest)
+    writeJson(terminalClaimPath, legacyClaim)
+    const before = readFileSync(terminalStatePath, 'utf8')
+
+    expect(terminal.generation.status(PROFILE_ID, terminal.request.run_id).state).toMatchObject({
+      schema_version: 'autodata-generation-state-1',
+      max_proposal_drafts: 3,
+      proposal_drafts_started: 1,
+    })
+    expect(terminal.generation.resume(PROFILE_ID, terminal.request.run_id).job_id).toBeUndefined()
+    expect(readFileSync(terminalStatePath, 'utf8')).toBe(before)
+
+    const nonterminalState = { ...legacyState, status: 'recovery_required' }
+    writeJson(terminalStatePath, nonterminalState)
+    expect(() => terminal.generation.resume(PROFILE_ID, terminal.request.run_id)).toThrowError(
+      expect.objectContaining({ code: 'STATE_CORRUPT' }),
+    )
+    expect(readFileSync(terminalStatePath, 'utf8')).toBe(`${canonicalJson(nonterminalState)}\n`)
   })
 
   it('refuses a materialized payload changed after the two-process gate', async () => {
