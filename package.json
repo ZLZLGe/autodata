@@ -84,6 +84,9 @@
     "smoke:freerouter": "pnpm run build && node scripts/freerouter-agent-smoke.mjs",
     "smoke:pjlab": "pnpm run build && node scripts/pjlab-agent-smoke.mjs",
     "stage4c:first-h1": "pnpm run build && node scripts/stage4c-first-h1.mjs",
+    "stage4c:freerouter-diagnostic": "pnpm run build && node scripts/stage4c-freerouter-diagnostic.mjs run",
+    "stage4c:freerouter-diagnostic:status": "pnpm run build && node scripts/stage4c-freerouter-diagnostic.mjs status",
+    "stage4c:first-h1-recovery-02": "pnpm run build && node scripts/stage4c-first-h1-recovery-02.mjs",
     "pack:check": "npm pack --dry-run",
     "check": "pnpm run typecheck && pnpm run test && pnpm run test:python && pnpm run test:profile && pnpm run pack:check",
     "prepare": "pnpm run build"
